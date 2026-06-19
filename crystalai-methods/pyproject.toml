@@ -1,0 +1,25 @@
+[project]
+name = "crystalai-methods"
+version = "0.1.0"
+description = "ML training for CrystalAI: Track A (classification) and Track B (generation)."
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "einops",
+    "pymatgen>=2024.1",
+    "scikit-learn",
+    "tqdm",
+    "pyyaml",
+    "wandb",
+    "crystalai-data",
+    "crystalai-simxrd",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crystalai_methods"]

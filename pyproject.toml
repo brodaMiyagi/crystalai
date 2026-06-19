@@ -1,0 +1,24 @@
+# CrystalAI monorepo — uv workspace root.
+# Virtual root: no [project] table, so it is never built or published.
+# It exists only to organize the three packages and share one lockfile.
+
+[tool.uv.workspace]
+members = [
+    "crystalai-data",
+    "crystalai-simxrd",
+    "crystalai-methods",
+]
+
+# Resolve the inter-package dependencies from the workspace instead of PyPI.
+# Entries declared at the root apply to every member.
+[tool.uv.sources]
+crystalai-data = { workspace = true }
+crystalai-simxrd = { workspace = true }
+crystalai-methods = { workspace = true }
+
+# Shared dev tooling for the whole workspace; `uv sync` installs these once.
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]

@@ -1,0 +1,22 @@
+[project]
+name = "crystalai-data"
+version = "0.1.0"
+description = "ICSD structure curation and experimental PXRD pattern ingestion for CrystalAI."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pymatgen>=2024.1",
+    "spglib>=2.0",
+    "gradio>=4.0",
+    "plotly>=5.15",
+    "py3dmol",
+    "tqdm",
+    "pyyaml",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crystalai_data"]

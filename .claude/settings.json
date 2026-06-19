@@ -12,5 +12,6 @@
       "Read(./**/wandb/**)",
       "Read(./**/*.cif)"
     ]
-  }
+  },
+  "model": "claude-opus-4-8"
 }
