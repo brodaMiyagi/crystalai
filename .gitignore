@@ -1,0 +1,11 @@
+__pycache__/
+ .venv/ 
+*.sqlite
+*.h5
+*.hdf5
+*.parquet
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+wandb/

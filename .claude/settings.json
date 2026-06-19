@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./**/*.sqlite)",
+      "Read(./**/*.h5)",
+      "Read(./**/*.hdf5)",
+      "Read(./**/*.parquet)",
+      "Read(./**/*.ckpt)",
+      "Read(./**/*.pt)",
+      "Read(./**/*.pth)",
+      "Read(./**/*.safetensors)",
+      "Read(./**/wandb/**)",
+      "Read(./**/*.cif)"
+    ]
+  }
+}
