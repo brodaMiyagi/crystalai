@@ -4,7 +4,7 @@ Multimodal ML for crystal-structure determination from real experimental PXRD. T
 
 Three independently-installable, independently-tested packages. Each keeps its own `pyproject.toml`, `src/`, and `tests/`. Run commands from the package directory, not from this root.
 
-- `crystalai-data/`    — curate ICSD CIFs; ingest RRUFF / opXRD-labeled / internal-lab patterns; visualization apps
+- `crystalai-data/`    — curate ICSD CIFs and the MP-20 subset; ingest RRUFF / opXRD-labeled / internal-lab patterns; visualization apps
 - `crystalai-simxrd/`  — simulate PXRD from CIFs (log-d production, 2θ validation); on-the-fly augmentation pipeline
 - `crystalai-methods/` — all ML training. Track A (classification: CS + SG), Track B (generation)
 
@@ -18,10 +18,10 @@ Every phase has an explicit validation gate (see the per-package roadmaps). Do n
 
 ## Hard constraints (do not reintroduce)
 
-- No `ase`, no `Pysimxrd`, no `mp-api`. pymatgen is the primary structure library.
-- ICSD is the only crystal-structure source. No MP, CrystDB, COD, MP-20-PXRD, or SimXRD-4M.
+- No `ase`, no `Pysimxrd`, no `mp-api`, no `spglib`. pymatgen is the primary structure library; space groups are read from the source (CIF / MP-20 CSV) and crystal systems derived, never re-analyzed.
+- ICSD is the primary, experimentally-verified source and the **sole** source for Track A and the encoder. MP-20 (DFT-relaxed MP subset, ≤20 atoms/cell, redistributable) is a **Track-B-only generation source**, added solely for licensing — a publicly releasable generator cannot be ICSD-trained (ICSD bars redistributing a model that emits full phases). Still no general MP, no CrystDB, no COD, no MP-20-PXRD pre-computed-pattern benchmark, no SimXRD-4M. The DFT-to-real caveat is why MP-20 is confined to Track B targets and kept out of Track A inputs.
 - The simulation core is NumPy throughout. PyTorch appears only at the augmentor / DataLoader boundary (`crystalai-simxrd` §5.2), never in the simulation math.
-- log(d) is the settled encoder/production coordinate; wavelength is an explicit FiLM input. The frozen-generator + frozen-encoder strategy is settled. Do not relitigate these settled commitments unless explicitly asked.
+- log(d) is the settled encoder/production coordinate; wavelength is an explicit FiLM input. The **from-scratch generator + frozen encoder** strategy is settled: Track B trains a flow generator (FlowMM/DiffCSP-lineage equivariant GNN) from scratch on the frozen encoder; the two are never co-trained, and PXRDGen/XtalNet are code scaffolding, not loaded checkpoints. Do not relitigate these settled commitments unless explicitly asked.
 
 ## Sources of truth
 
@@ -30,4 +30,4 @@ Every phase has an explicit validation gate (see the per-package roadmaps). Do n
 
 ## Migration
 
-Parts of the code exist in older repos. Migrated code must be adapted to the constraints above (old code likely uses `ase` / `Pysimxrd`, 2θ-native simulation, or supercell disorder expansion — all now disallowed) and re-validated against the gates. Never trust a ported file because it worked before.
+Parts of the code exist in older repos. Migrated code must be adapted to the constraints above (old code likely uses `ase` / `Pysimxrd`, 2θ-native simulation, supercell disorder expansion, spglib symmetry re-derivation, or a frozen pretrained generator + conditioning adapter — all now disallowed) and re-validated against the gates. Never trust a ported file because it worked before.

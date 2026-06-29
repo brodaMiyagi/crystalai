@@ -1,6 +1,6 @@
 # CrystalAI-methods — Roadmap
 
-**Scope:** All ML training for the CrystalAI pipeline. Track A (classification: crystal system + space group). Track B (generation: conditional crystal structure generation via XtalNet / PXRDGen). Encoders, loss functions, training loops, evaluation.
+**Scope:** All ML training for the CrystalAI pipeline. Track A (classification: crystal system + space group). Track B (generation: conditional crystal structure generation via a flow generator trained from scratch, using PXRDGen / XtalNet as code scaffolding). Encoders, loss functions, training loops, evaluation.
 
 **Out of scope:** Data curation (lives in `CrystalAI-data`). Pattern simulation (lives in `CrystalAI-simXRD`).
 
@@ -16,8 +16,8 @@ The pipeline is organized into two tracks, each with two phases. Each phase is v
 |-------|------|----------------------------------|
 | A1 | Single-input baseline classifier | Full pattern only → CS + SG heads |
 | A2 | Multimodal robust classifier | + peak-position encoder, VICReg alignment, classification firewall |
-| B1 | Vanilla generative conditioning | Frozen generator + lightweight encoder from scratch, condition only |
-| B2 | Robust generative conditioning | + frozen A2 encoder in place of B1's encoder |
+| B1 | Vanilla generative conditioning | From-scratch flow generator conditioned on a frozen lightweight encoder |
+| B2 | Robust generative conditioning | + frozen A2 encoder in place of B1's encoder; fresh from-scratch generator |
 
 Phase A2's encoder is the artifact that gets transferred (frozen) into Phase B2. This is the only structural coupling between the tracks.
 
@@ -203,53 +203,48 @@ L_disentangle = ||CrossCov(z_lattice, z_atomic)||²_F
 
 ### 3.1 Phase B1 — Vanilla conditioning
 
-**Goal.** Establish a vanilla generative baseline: lightweight encoder, frozen generator, only the conditioning layers train. Quantify what naive conditioning achieves so that Phase B2's improvement is measurable.
+**Goal.** Establish a vanilla generative baseline: lightweight frozen encoder, a flow generator trained **from scratch** to consume that encoder's conditioning. Quantify what naive conditioning achieves so Phase B2's improvement is measurable.
 
-**Encoder.** Same no-pool 1D CNN architecture as A1, but trained with a simpler objective: either (a) CS + SG classification on simulated patterns only (no multimodal, no firewall, no contrastive losses, no experimental data alignment), or (b) MSE pretraining on simulated patterns (regression to peak-list or similar). Default: (a) — classification-trained is closer to the kind of supervision a naive baseline would use, and provides a more honest comparison with A2's classification-aware-but-contrastively-aligned encoder.
+**Encoder.** Same no-pool 1D CNN architecture as A1, trained with a simpler objective: either (a) CS + SG classification on simulated patterns only (no multimodal, no firewall, no contrastive losses, no experimental alignment), or (b) MSE pretraining on simulated patterns (regression to peak-list or similar). Default: (a) — closer to the supervision a naive baseline would use, and an honest comparison with A2's contrastively-aligned encoder. Once trained it is **frozen**; only the generator trains. The encoder takes a log-d binned pattern + wavelength (FiLM as before); no peak-position view, no projection heads — a single representation vector conditions the generator.
 
-The encoder takes a log-d binned pattern + wavelength input. Wavelength FiLM as before. No peak-position view, no projection heads, no disentanglement — a single representation vector goes to the conditioning layers.
+**Generator.** A flow generator (FlowMM/DiffCSP-lineage equivariant GNN over lattice + fractional coords + atom types), **trained from scratch**. PXRDGen (Code Ocean, flow) is the primary scaffolding; XtalNet (Zenodo 13629658, diffusion) is the alternative. These are **code references, not loaded checkpoints** — no pretrained generator weights enter the pipeline. Rationale: a frozen pretrained generator would lock in its own training-set structure prior and its own encoder's conditioning space, neither compatible with our targets or our log-d encoder (`DESIGN_DECISIONS.md` §8). The per-run cost is ~1 day on a 24 GB card for this model class.
 
-**Generator.** XtalNet or PXRDGen, loaded from the published checkpoint, **frozen end-to-end**. The choice between XtalNet and PXRDGen is deferred to prototyping (`ROADMAP.md` Open decisions); PXRDGen's flow backbone is cheaper than XtalNet's diffusion, which favors PXRDGen given the compute envelope.
+**Conditioning interface.** The frozen encoder's representation is fed to the generator's denoiser as an extra input at **every flow-matching step**. Because the generator is trained from scratch, its conditioning interface is built for our encoder's output distribution from step one — there is no adapter remapping our representation onto a foreign denoiser. Conditioning is learned implicitly through the generation loss; there is no separate conditioning objective.
 
-**Conditioning interface.** The encoder's representation feeds an adapter MLP (the *conditioning layers*) that maps the representation to whatever conditioning signal the generator expects. This adapter is the only thing being trained.
+**Training data.** Simulated patterns from `CrystalAI-simXRD` on the **≤20-atom structure subset** (`n_atoms_le_20`). For B1 development this is the redistributable MP-20 pool (`source='mp-20'`); the internal ICSD+MP-20 ≤20-atom union is an optional reported variant (`DESIGN_DECISIONS.md` §2, §8). The encoder being conditioned was trained on full ICSD — superset-train / subset-deploy, which is benign. No experimental data conditions the generator at this phase.
 
-For PXRDGen specifically: the published model conditions its flow on a PXRD feature vector produced by its own pretrained CNN/Transformer encoder. The adapter must produce a vector compatible with PXRDGen's conditioning interface. Implementation: replace PXRDGen's encoder output with `adapter(our_encoder_output)`, train the adapter on the same generation loss PXRDGen used (flow-matching or score-matching on simulated CIF → pattern → reconstruct CIF pairs).
-
-For XtalNet: analogous, with the diffusion conditioning interface.
-
-**Training data.** Simulated patterns from `CrystalAI-simXRD` on ICSD CIFs (the same data Track A uses). No experimental data — this is the encoder's classification training set; Phase B1 does not yet involve experimental conditioning.
-
-**Loss.** The generator's native loss (flow-matching for PXRDGen, denoising score-matching for XtalNet), applied only to the adapter parameters via gradient masking on the generator's weights.
+**Loss.** The generator's native flow-matching loss (denoising score-matching if the XtalNet scaffolding is used), training the full generator from scratch (the encoder is frozen via gradient masking, not the generator).
 
 **Evaluation.**
 - **Top-k match rate** on a held-out set of experimental patterns from the labeled pool: k=1, 5, 10, 20 via `pymatgen.analysis.structure_matcher.StructureMatcher`.
 - **Atomic RMSD (Å)** between generated and ground-truth structures.
 - **Rwp after Rietveld refinement** of the generated structure against the experimental pattern.
-- **CS/SG correctness** of generated structures (via Spglib on the generated CIF).
+- **CS/SG correctness** of generated structures (via the source-read / derived labels on the matched CIF; `crystalai-data` symmetry utilities, not spglib).
+- **Unconditional-prior probe** (gap-compression canary): sample the generator with conditioning ablated and measure match rate. A high unconditional match rate means the generator is leaning on a learned small-cell prior rather than the conditioning — both B1 and B2 would then rise on the prior and the B1→B2 lift would shrink (`DESIGN_DECISIONS.md` §8).
 - **Case studies**: 5–10 generated CIFs side-by-side with experimental patterns, with overlay of re-simulated patterns.
 
-**Phase B1 validation gate.** A defensible baseline that's clearly worse than published PXRDGen / XtalNet numbers on their own benchmarks (expected, given we're using real-data evaluation, not MP-20-PXRD), but well above random. If B1 produces generated structures with no meaningful relationship to the conditioning input (RMSD ~ random, match rate ~ 0%), the conditioning-layer interface is broken and needs debugging before B2 begins.
+**Phase B1 validation gate.** A defensible baseline well above random, and **clearly conditioning-driven** — the conditioned match rate must beat the unconditional-prior probe by a meaningful margin. (It will be below published PXRDGen/XtalNet numbers on their own clean-input benchmarks; expected, since we evaluate on real data.) If generated structures bear no relationship to the conditioning input (conditioned ≈ unconditional, or RMSD ~ random), the conditioning interface or the from-scratch training is broken and must be debugged before B2.
 
 ---
 
 ### 3.2 Phase B2 — Robust conditioning
 
-**What's new vs B1.** The B1 encoder is replaced by the **Phase A2 encoder, frozen end-to-end**. Everything else stays the same: same generator (frozen), same adapter architecture (re-initialized; trained from scratch on the new encoder's output distribution), same generation loss, same evaluation protocol.
+**What's new vs B1.** The B1 encoder is replaced by the **Phase A2 encoder, frozen end-to-end**. A **fresh flow generator is trained from scratch** on the A2 encoder's conditioning distribution — same architecture, same recipe, same training data, same generation loss, same evaluation as B1. The only variable across B1→B2 is the encoder; each encoder gets its own best-fit generator. This is a cleaner comparison than remapping a thin adapter onto a fixed denoiser (the prior design), which was confounded by adapter capacity.
 
-**Conditioning input.** A2's representation has more structure than B1's — three sub-representations (z_lattice, z_atomic, z_exp) with disentanglement guarantees. The adapter consumes `[z_lattice; z_atomic]` (z_exp is excluded — experimental artifacts should not condition generation).
+**Conditioning input.** A2's representation has more structure than B1's — three sub-representations (z_lattice, z_atomic, z_exp) with disentanglement guarantees. The generator conditions on `[z_lattice; z_atomic]` (z_exp excluded — experimental artifacts should not condition generation).
 
 Conditioning strategies to evaluate:
-1. **Direct concatenation**: `[z_lattice; z_atomic]` as a single 256-dim conditioning vector.
-2. **Hierarchical**: z_lattice conditions lattice-parameter prediction (early steps of the flow / diffusion); `[z_lattice; z_atomic]` conditions atom-position prediction (later steps).
-3. **Confidence-weighted**: modulate the conditioning by `cos_sim(z_lattice_profile, z_lattice_peaks)` — when the two views agree, condition more confidently; when they disagree, soften the conditioning. (Requires combined-mode input with manually-verified peaks at inference; reserved for case studies.)
+1. **Direct concatenation**: `[z_lattice; z_atomic]` as a single 256-dim conditioning vector fed at every flow step.
+2. **Hierarchical**: z_lattice conditions the lattice/early flow steps; `[z_lattice; z_atomic]` conditions atom-position/later flow steps.
+3. **Confidence-weighted**: modulate conditioning by `cos_sim(z_lattice_profile, z_lattice_peaks)` — condition more confidently when the two views agree. (Requires combined-mode input with manually-verified peaks at inference; reserved for case studies.)
 
-Default: strategy 1, with strategy 2 as a small ablation.
+Default: strategy 1, with strategy 2 as a small ablation. Because the generator is trained from scratch on this conditioning, the strategy is a property of the generator's input head, not an adapter bolted onto a fixed denoiser.
 
-**Training data.** Same as B1: simulated patterns on ICSD CIFs. But now matched-sample alignment is available: for each simulated training pattern, we have the CIF; for each experimental pattern in the labeled pool, we may also have the CIF; matched sim-exp pairs can be presented to the adapter as a curriculum (start with sim-only, transition to mixed sim-exp partway through training).
+**Training data.** Same ≤20-atom subset as B1. Matched-sample structure is available: for each simulated training pattern we have the structure, and for labeled experimental patterns with a CIF we can present matched sim-exp pairs as a curriculum (sim-only → mixed sim-exp partway through). Note the encoder is frozen, so this curriculum shapes the *generator's* use of the conditioning, not the representation.
 
-**Evaluation.** Same as B1, on the same held-out set. **Must improve over B1** for B2 to be considered successful — the lift is the paper's headline result.
+**Evaluation.** Same as B1, on the same held-out set, including the unconditional-prior probe. **Must improve over B1** for B2 to be considered successful — the lift is the paper's headline result. The lift must survive the gap-compression check: B2's advantage over B1 has to come from better conditioning, not from both generators sharing a strong unconditional small-cell prior.
 
-**Phase B2 validation gate.** Measurable lift over B1 on top-k match rate, RMSD, and Rwp post-Rietveld. Ideally, the lift is strong enough to be visually obvious in case studies (e.g., a pattern where B1 generates a structure with the wrong space group but B2 generates the correct one).
+**Phase B2 validation gate.** Measurable lift over B1 on top-k match rate, RMSD, and Rwp post-Rietveld, with the conditioned-vs-unconditional gap intact. Ideally the lift is visually obvious in case studies (e.g., a pattern where B1 generates the wrong space group but B2 generates the correct one).
 
 ---
 
@@ -261,11 +256,13 @@ The A2 encoder, including its peak-position encoder, projection heads, and train
 
 If at inference time a crystallographer supplies manually-verified peak positions alongside an experimental pattern, the combined-mode input `z_lattice = (z_lattice_profile + z_lattice_peaks) / 2` can be used. This is the only Track B inference path that touches the peak encoder.
 
-### 4.2 Frozen encoder, frozen generator
+### 4.2 Frozen encoder, from-scratch generator
 
-Both are frozen in Phase B2. If the conditioning layers cannot bridge the gap between the encoder output and what the generator expects, B2 plateaus at a poor baseline. Fallback: unfreeze the projection heads (the three MLPs in the encoder that produce z_lattice / z_atomic / z_exp), but keep the encoder trunk frozen. This is a small change in parameter count but provides a way for the generative objective to shape the conditioning representation. The encoder trunk itself remains frozen — corrective gradients from generation should not undo the classification firewall.
+In both B1 and B2 the **encoder is frozen and the generator is trained from scratch**; they are never co-trained. Co-training would let the generation loss reshape the encoder, collapsing the A2→B2 transfer that is the paper's thesis. So corrective gradients from generation never reach the encoder — the A2 firewall (`DESIGN_DECISIONS.md` §5) must therefore have protected the conditioning representation adequately during A2, because B2 cannot fix a categorically-contaminated encoder.
 
-If even projection-head unfreezing doesn't help, the inductive-bias mismatch between our encoder and the generator's training is severe. At that point, partial fine-tuning of the generator's late layers becomes the next option — outside the current compute envelope.
+Because the generator is trained natively for the frozen encoder, an "adapter mismatch" is no longer a failure mode — there is no adapter. If B2 fails to beat B1, the suspect is the encoder representation itself. Fallback: unfreeze the A2 projection heads (the three MLPs producing z_lattice / z_atomic / z_exp), keeping the encoder trunk frozen, and retrain the generator. This lets the generative objective shape the conditioning representation slightly without undoing the firewall on the trunk. If even that doesn't help, the encoder side needs deeper reconsideration; this is the worst case where Track B becomes a future-work section (`DESIGN_DECISIONS.md` §8).
+
+**Gap-compression watch.** A from-scratch generator on the low-entropy ≤20-atom subset can learn a strong unconditional prior. The unconditional-prior probe (§3.1 evaluation) is the canary; if the conditioned-vs-unconditional gap compresses, the B1→B2 comparison loses signal regardless of headline match rates.
 
 ### 4.3 Input mode dropout in A2
 
@@ -331,15 +328,16 @@ crystalai-methods/
 │       │   └── b2_robust.py            # Phase B2 conditioning training
 │       │
 │       ├── generators/
-│       │   ├── pxrdgen_adapter.py      # PXRDGen integration + conditioning adapter
-│       │   ├── xtalnet_adapter.py      # XtalNet integration + conditioning adapter
-│       │   └── frozen_wrapper.py       # Generic wrapper for freezing pretrained generators
+│       │   ├── flow_generator.py     # From-scratch flow generator (FlowMM/DiffCSP-lineage equivariant GNN)
+│       │   ├── conditioning.py       # Encoder-embedding → per-step conditioning input (concat / hierarchical / confidence-weighted)
+│       │   ├── flow_matching.py      # Flow-matching loss + sampler (score-matching variant if XtalNet scaffolding)
+│       │   └── scaffolding/          # Vendored PXRDGen / XtalNet code references (CSPNet/FlowMM blocks); NO checkpoints
 │       │
 │       └── evaluation/
 │           ├── classification_eval.py  # CS / SG accuracy, per-CS breakdown, per-source breakdown
 │           ├── representation_viz.py   # t-SNE, cosine similarity matrices
 │           ├── alignment_eval.py       # Matched-sample alignment quality
-│           ├── generation_eval.py      # Top-k match, RMSD, Rwp, Spglib CS/SG check
+│           ├── generation_eval.py      # Top-k match, RMSD, Rwp, CS/SG check, unconditional-prior probe
 │           └── case_studies.py         # Generate + overlay case study plots
 │
 ├── tests/
@@ -368,6 +366,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
+    "torch-geometric",                   # equivariant-GNN flow generator (Track B)
     "numpy>=1.24",
     "scipy>=1.10",
     "einops",
@@ -380,9 +379,10 @@ dependencies = [
     "crystalai-simxrd",
 ]
 
-# Stage 4 generators — pinned to upstream checkpoints
-# XtalNet:  https://github.com/dptech-corp/XtalNet
-# PXRDGen:  https://codeocean.com/capsule/7727770/tree/v1
+# Track B generator — trained from scratch; upstream repos used as CODE SCAFFOLDING ONLY (no checkpoints)
+# PXRDGen (flow, primary scaffolding):  https://codeocean.com/capsule/7727770/tree/v1
+# XtalNet  (diffusion, alternative):    https://github.com/dptech-corp/XtalNet  (Zenodo 13629658)
+# torch-geometric is required for the equivariant-GNN generator (CSPNet/FlowMM-lineage blocks)
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
@@ -422,21 +422,22 @@ The implementation order is strictly phase-by-phase, with validation gates betwe
 21. Train A2 (initialize from A1 checkpoint), evaluate, **validation gate**: lift over A1 + meaningful matched-sample alignment.
 
 ### Sprint 4: B1 vanilla generative
-22. `frozen_wrapper.py` — utility for freezing pretrained generators.
-23. `pxrdgen_adapter.py` (primary) and/or `xtalnet_adapter.py`.
-24. `b1_vanilla.py` training loop.
-25. `generation_eval.py`, `case_studies.py`.
-26. Train B1, evaluate, **validation gate**: defensible baseline well above random.
+22. `generators/scaffolding/` — vendor PXRDGen/XtalNet code blocks (CSPNet/FlowMM); no checkpoints.
+23. `flow_generator.py` + `flow_matching.py` — from-scratch flow generator and loss/sampler; sanity-check unconditional training on the ≤20-atom subset reproduces a CrystalFlow-class baseline (~1 day/run).
+24. `conditioning.py` — frozen-encoder embedding → per-step conditioning input.
+25. `b1_vanilla.py` training loop (frozen lightweight encoder + from-scratch generator).
+26. `generation_eval.py` (incl. unconditional-prior probe), `case_studies.py`.
+27. Train B1, evaluate, **validation gate**: defensible baseline well above random AND conditioned match rate clearly beats the unconditional-prior probe.
 
 ### Sprint 5: B2 robust generative
-27. `b2_robust.py` training loop (reuses generator adapter; swaps encoder).
-28. Train B2 with A2 encoder frozen, evaluate, **validation gate**: lift over B1.
+28. `b2_robust.py` training loop (fresh from-scratch generator on the same recipe; swaps in the frozen A2 encoder).
+29. Train B2 with A2 encoder frozen, evaluate, **validation gate**: lift over B1 with the conditioned-vs-unconditional gap intact.
 
 ### Sprint 6: Paper experiments
-29. Final evaluation runs with the best hyperparameter settings.
-30. Ablations for the paper (firewall leak weights, conditioning strategy, encoder choice).
-31. Case study generation.
-32. Figure preparation.
+30. Final evaluation runs with the best hyperparameter settings.
+31. Ablations for the paper (firewall leak weights, conditioning strategy, encoder choice, ICSD+MP-20 vs MP-20-only generator).
+32. Case study generation.
+33. Figure preparation.
 
 The compute envelope (~6 major training runs before submission, see `ROADMAP.md`) maps to Sprints 1, 2 (combined into one ablation table), 3, 4, 5, plus one buffer run.
 
@@ -447,7 +448,9 @@ The compute envelope (~6 major training runs before submission, see `ROADMAP.md`
 These are not yet resolved and should be reconsidered when the empirical evidence is in hand:
 
 - **A1 architecture ablation depth.** Reduced-scale or full-scale? Default: reduced. Revisit if A1 GRU or Transformer surprises on the real-data metric.
-- **Generator choice (B1/B2).** PXRDGen vs XtalNet vs both. Default: PXRDGen first (cheaper backbone). Revisit if the adapter interface for PXRDGen turns out to be more complex than XtalNet's.
-- **Frozen-encoder + frozen-generator viability.** If B1 doesn't reach a defensible baseline, unfreeze projection heads as the first fallback.
+- **Generator scaffolding (B1/B2).** PXRDGen (flow) vs XtalNet (diffusion) as the from-scratch generator's code base. Default: PXRDGen flow scaffolding (cheaper, more natural). Both are references, not checkpoints. Revisit if the flow-matching loop is harder to stand up than the diffusion one.
+- **Generator training set.** MP-20-only (released) vs ICSD+MP-20 ≤20-atom (internal/reported). Default: develop on MP-20; run the ICSD+MP-20 variant only if MP-20 alone underperforms (`DESIGN_DECISIONS.md` §2, §8).
+- **Gap compression.** If the unconditional-prior probe shows the generator leaning on a small-cell prior, the B1→B2 lift is suspect; audit conditioning strength before trusting headline numbers.
+- **Conditioning-failure fallback.** If B2 doesn't beat B1, unfreeze the A2 projection heads (not the trunk) and retrain the generator as the first fallback.
 - **InfoNCE τ × disentanglement weight α₃ interaction.** Sweep at the start of A2.
 - **Mask injection mechanism for GRU and Transformer ablations.** Concat-feature + output-masking (GRU); attention masking (Transformer). The fixed-window setup for GRU makes the bidirectional backward pass pad-aware via the mask but doesn't get the `pack_padded_sequence` benefit; this is one reason the fixed-window GRU is a weaker variant and is itself a possible reason an ablation favors CNN.
