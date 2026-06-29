@@ -5,6 +5,7 @@ description = "ML training for CrystalAI: Track A (classification) and Track B (
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
+	"torch-geometric",
     "numpy>=1.24",
     "scipy>=1.10",
     "einops",
