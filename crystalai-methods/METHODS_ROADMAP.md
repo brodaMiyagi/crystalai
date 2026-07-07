@@ -317,8 +317,8 @@ crystalai-methods/
 │       │
 │       ├── data/
 │       │   ├── simulated_dataset.py    # Wraps CrystalAI-simXRD on-the-fly simulation
-│       │   ├── experimental_dataset.py # Loads from CrystalAI-data experimental indices
-│       │   ├── matched_pairs.py        # Pairs labeled experimental patterns with their CIFs
+│       │   ├── experimental_dataset.py # Loads from CrystalAI-data unified experimental index; native→log-d conversion + binning in __getitem__
+│       │   ├── matched_pairs.py        # Pairs labeled experimental patterns with their CIFs (resolves cif_id then cif_path)
 │       │   └── mixed_dataloader.py     # 70:30 sim:exp batch composition
 │       │
 │       ├── training/

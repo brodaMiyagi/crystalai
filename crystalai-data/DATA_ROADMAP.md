@@ -195,21 +195,25 @@ All structure iterators yield pymatgen `Structure` objects (disorder preserved),
 
 ## 2. Experimental PXRD patterns
 
-Experimental data is **not** centralized into a single database. Each source has its own ingest path, its own per-source CSV index, and points at original files in place. This avoids lossy schema conversions for sources with heterogeneous metadata.
+Experimental data **is** centralized, into a common store inside `crystalai-data` (the `xrddata` subpackage). This reverses the earlier per-source-index design: at ~5k patterns the fork-memory argument that drove §1's SQLite-blob choice does not apply, and a single normalized store is what a common DataLoader and the matched-sample CIF lookup (`DESIGN_DECISIONS.md` §6) both need. The store keeps every pattern as **canonical text files** (`.xy` for patterns, `.cif` for structures) as the source of truth — nothing is resampled or re-binned at ingest, so the normalization is lossless and every file stays openable for manual investigation. A single unified `index.csv` carries the metadata and the file pointers (CSV, not SQLite: at ~5k rows the index loads once into a DataFrame and is served from memory, so there is no random-access-across-processes problem to solve and CSV stays the lighter, greppable choice).
+
+**Native format is preserved; all preprocessing is deferred to the consumer's `__getitem__`.** Patterns are stored in the coordinate they arrive in (2θ for angle-dispersive lab/synchrotron data); since the wavelength is in the index, the conversion to d / log-d and the binning happen on-the-fly in `CrystalAI-methods`' `experimental_dataset.py`. Background subtraction is likewise done downstream when `bgsub` is absent.
+
+> **Deferred optimization (note, not built).** If on-the-fly conversion in `__getitem__` proves too slow, add a second pair of preprocessed files per pattern — the binned profile view and the binned peak view, both as `.xy` — to the store, and have the Dataset prefer them when present. Not needed at ~5k patterns; revisit only if profiling shows the conversion dominating DataLoader time.
 
 ### Sources
 
 | Source | Size | Labels | Wavelength | Notes |
 |--------|------|--------|------------|-------|
-| RRUFF | ~3,000 | Full CIF for most | Cu Kα (mostly) | Well-characterized minerals; high-quality experimental references |
-| opXRD-labeled | ~1,000 | Full structure labels | Mixed (Cu, Mo, Co, synchrotron) | The labeled subset of Zenodo's opXRD release |
+| RRUFF | ~3,000 | Full CIF for most | Cu Kα (mostly) | Separate raw and processed (background-subtracted) xy folders; some entries carry refinement folders with phase/structure and peak positions. Files are uniquely named and serve as identifiers |
+| opXRD-labeled | ~1,000 | Full structure labels | Mixed (Cu, Mo, Co, synchrotron) | Zenodo opXRD release (CNRS & HKUST). One JSON per pattern; a `phases` key carries the CIF/structure information |
 | Internal lab | <1,000 | Variable (some CS-only, some full CIF) | Cu Kα, Mo Kα | STADI-P / STADI-MP instruments |
 
 **Total: ~5k labeled experimental patterns.** ~90% have full CIFs, enabling matched-sample contrastive alignment (see `DESIGN_DECISIONS.md` §6).
 
 The 91k uncurated opXRD pool is **not used** in this iteration — see `DESIGN_DECISIONS.md` §6.
 
-### Per-source ingest structure
+### Store layout
 
 ```
 src/crystalai_data/
@@ -220,49 +224,66 @@ src/crystalai_data/
 │   ├── convert_mp20.py          # MP-20 train/val/test CSVs → SQLite
 │   ├── symmetry.py              # SG↔CS↔symbol lookup utilities (no spglib)
 │   └── api.py                   # CrystalDatabase query class
-├── experimental/
+├── xrddata/
 │   ├── __init__.py
-│   ├── rruff/
-│   │   ├── ingest.py            # raw RRUFF → CSV index + canonicalized pattern files
-│   │   ├── index.csv            # output: per-pattern metadata
-│   │   └── README.md            # source-specific notes
-│   ├── opxrd/
-│   │   ├── ingest.py
-│   │   ├── index.csv
-│   │   └── README.md
-│   └── lab/
-│       ├── ingest.py
-│       ├── index.csv
-│       └── README.md
+│   ├── database.py              # XRDDatabase: unified index (CSV) + pattern-file resolver
+│   ├── ingest_rruff.py          # RRUFF folders → canonical files + index rows
+│   ├── ingest_opxrd.py          # opXRD JSON    → canonical files + index rows
+│   ├── ingest_lab.py            # STADI raw     → canonical files + index rows
+│   ├── audit.py                 # wavelength + quality audit
+│   └── store/
+│       ├── index.csv            # unified index (one row per pattern)
+│       └── patterns/
+│           └── <source>/<source_id>/
+│               ├── raw.xy       # as-measured, native coordinate (required)
+│               ├── bgsub.xy     # background-subtracted (absent ⇒ null)
+│               ├── peaks.xy     # peak list in the SAME coordinate as raw (absent ⇒ null)
+│               └── structure.cif# phase(s); multi-block CIF if >1 phase (absent ⇒ null, or cif_id → crystals.sqlite)
 └── visualization/
     ├── crystal_browser.py       # Gradio app for CIF browsing
     └── pattern_browser.py       # Gradio app for experimental pattern viewing
 ```
 
-### CSV index format
+Each source's `ingest_*.py` normalizes into this one layout: it extracts the pattern (from opXRD's JSON, RRUFF's xy folders, the STADI raw) into `raw.xy` / `bgsub.xy`, the structure (opXRD's `phases` entry, RRUFF's refinement CIF) into `structure.cif`, and the peak list into `peaks.xy` — writing text files verbatim in their native coordinate, never resampling. The canonical files are the source of truth; the index is rebuildable from them.
 
-Each `index.csv` carries one row per pattern with at minimum:
+### Unified index schema
 
-| Column | Description |
-|--------|-------------|
-| `pattern_id` | Source-prefixed unique identifier (e.g., `rruff_R040118`) |
-| `file_path` | Path to the original pattern file (relative to source root) |
-| `wavelength_A` | Wavelength in Å — **required**. Patterns with missing or suspicious wavelength metadata are flagged and excluded |
-| `format` | File format tag (`xy`, `xrdml`, `raw_stadi`, ...) — drives the loader |
-| `crystal_system` | If labeled (else null) |
-| `space_group` | If labeled (else null) |
-| `cif_id` | Reference into `crystals.sqlite` if a CIF is available (else null) |
-| `quality_flag` | Source-specific quality tag (e.g., `clean`, `noisy`, `multi_phase`, `amorphous`) |
-| `notes` | Free-text notes from ingest |
+One row per pattern in `store/index.csv`. File paths are relative to `store/`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | int | Our stable internal id (default, autoincrement) — the primary handle downstream |
+| `source` | str | `'rruff'` \| `'opxrd'` \| `'lab'` |
+| `source_id` | str | RRUFF: `<rruff_id>`; opXRD: `opXRD_<opxrd_source>_<json_filename>`; lab: instrument+run id. `(source, source_id)` is unique |
+| `raw_path` | str | As-measured `.xy` (required) |
+| `bgsub_path` | str | Background-subtracted `.xy`; null ⇒ absent, subtraction done in `__getitem__` |
+| `peaks_path` | str | Peak list `.xy`, positions in the **same coordinate as `raw`**; null ⇒ source ships no peaks |
+| `x_coord` | str | Native x-axis: `'two_theta'` \| `'d'` \| `'tof'` — drives the `__getitem__` conversion |
+| `wavelength_A` | float | Å; **nullable** — null for TOF (none yet). Required for angle-dispersive data |
+| `format` | str | Raw-loader tag (`xy`, `xrdml`, `raw_stadi`, ...) |
+| `crystal_system` | int | 1–7 if labeled (else null) |
+| `space_group` | int | 1–230 if labeled (else null) |
+| `a`, `b`, `c` | float | Cell edge lengths (Å) if labeled (else null) |
+| `alpha`, `beta`, `gamma` | float | Cell angles (degrees) if labeled (else null) |
+| `formula` | str | Reduced formula — atom types + stoichiometry (e.g. `TiO2`); full atom positions live in the CIF |
+| `n_phases` | int | Phase count in `structure.cif` (default 1). `> 1` marks a multi-phase pattern |
+| `cif_id` | int | Reference into `crystals.sqlite` when the structure coincides with an ICSD/MP entry (else null) |
+| `cif_path` | str | Standalone CIF in the store (RRUFF/opXRD phase), for structures not in `crystals.sqlite` (else null) |
+| `quality_flag` | str | `clean` \| `noisy` \| `multi_phase` \| `amorphous` |
+| `notes` | str | Free-text notes from ingest |
+
+Atom-level detail (types, stoichiometry, **positions**) is reached through the CIF (`cif_id` first, then `cif_path`); `formula` is the queryable projection of types + stoichiometry, mirroring the crystals-side split where positions stay in the structure and scalars are exposed as columns. A row with both CIF pointers null is labels-only (CS/SG/cell/formula, no positions) or unlabelled. The six cell scalars are stored as columns because a labelled cell can exist without a refined structure, and because they are filterable without opening a CIF.
+
+**Multi-phase handling.** When a pattern resolves to more than one phase (notably opXRD's plural `phases`), all phases are written into a single multi-block `structure.cif` and `n_phases` records the count. The scalar label columns (`crystal_system`, `space_group`, cell, `formula`) describe the **major/first** phase only, so `n_phases > 1` is the signal that those labels are ambiguous. Multi-phase patterns are **excluded from matched-sample training by default** — they violate the one-pattern-one-structure assumption that VICReg / InfoNCE / matched-sample alignment depend on (`DESIGN_DECISIONS.md` §6) — but are retained in the store for inspection and interesting-case studies. `quality_flag='multi_phase'` is set for convenience filtering; `n_phases` is the authoritative count.
 
 Source-specific columns (instrument ID, 2θ range, step size, etc.) can be added per source.
 
 ### Wavelength audit
 
-Wavelength metadata accuracy is required for the W1 wavelength-conditioning strategy (`DESIGN_DECISIONS.md` §1). The ingest pipeline includes an audit step:
+Wavelength metadata accuracy is required for the wavelength-conditioning strategy (`DESIGN_DECISIONS.md` §1). `audit.py` runs over the store:
 
-- Patterns with no wavelength metadata are flagged in the `notes` column and excluded from training.
-- Patterns with suspicious wavelength metadata (values outside [0.4, 2.5] Å, or wavelengths inconsistent with the recorded instrument) are flagged for manual review.
+- For **angle-dispersive** patterns (`x_coord` ∈ {`two_theta`, `d`}): missing wavelength is disqualifying — flagged in `notes` and excluded from training. Suspicious wavelength (values outside [0.4, 2.5] Å, or inconsistent with the recorded instrument) is flagged for manual review.
+- For **TOF** patterns (`x_coord = 'tof'`): null wavelength is expected, not an error, and does not exclude the pattern. (TOF also has no FiLM wavelength input — handling deferred; none in the pool yet.)
 - Internal lab patterns are already annotated with wavelength (Cu Kα or Mo Kα per STADI-P / STADI-MP) — these need no audit beyond format validation.
 
 ---
@@ -281,11 +302,11 @@ Loads `crystals.sqlite` and provides:
 
 ### Pattern browser (`pattern_browser.py`)
 
-Loads the three experimental indices (RRUFF, opXRD, lab) and provides:
+Loads the unified experimental index (`store/index.csv`) and provides:
 
 - Source / label filtering.
-- Per-pattern view: 2θ-I and log-d-I overlay, raw vs background-subtracted toggle, peak-position overlay where available, metadata panel.
-- Side-by-side comparison: experimental vs simulated (the latter via `CrystalAI-simXRD` if `cif_id` is non-null).
+- Per-pattern view: 2θ-I and log-d-I overlay (converting from the stored native coordinate via `wavelength_A`), raw vs background-subtracted toggle, peak-position overlay where available, metadata panel.
+- Side-by-side comparison: experimental vs simulated (the latter via `CrystalAI-simXRD` if `cif_id` or `cif_path` is non-null).
 - Distribution plots over the experimental pool: wavelength distribution per source, CS distribution among labeled, instrument distribution.
 
 ---
@@ -295,7 +316,7 @@ Loads the three experimental indices (RRUFF, opXRD, lab) and provides:
 | Consumer | What it reads |
 |----------|---------------|
 | `CrystalAI-simXRD` | `crystals.sqlite` via the `CrystalDatabase` API (for simulating training patterns) |
-| `CrystalAI-methods` | `crystals.sqlite` (Track A: `source='icsd'` pool; Track B: `n_atoms_le_20` subset, by `source`; plus matched-sample alignment — finding the CIF behind an experimental pattern) and the three experimental indices (for loading training/evaluation patterns) |
+| `CrystalAI-methods` | `crystals.sqlite` (Track A: `source='icsd'` pool; Track B: `n_atoms_le_20` subset, by `source`; plus matched-sample alignment — finding the CIF behind an experimental pattern, resolving `cif_id` then `cif_path`) and the unified experimental index `store/index.csv` (for loading training/evaluation patterns) |
 
 There is no other coupling. Each downstream repo imports `crystalai_data` and uses the API. The Track-A-vs-Track-B and ICSD-vs-MP-20 distinctions are query filters on the one database, not separate stores.
 
@@ -311,8 +332,8 @@ There is no other coupling. Each downstream repo imports `crystalai_data` and us
 | 4 | `convert_icsd.py` — full ICSD walk (~290k structures); SG from CIF text, CS derived, collection-code→icsd_id mapping, junction-table population |
 | 5 | `convert_mp20.py` — MP-20 train/val/test CSV ingest; SG from CSV, native split honored, `n_atoms_le_20=1` |
 | 6 | `CrystalDatabase` API + tests (source/subset/split filters, element-membership queries) |
-| 7 | Per-source experimental ingest scripts (RRUFF first, opXRD second, lab third) |
-| 8 | Wavelength audit pass over all experimental sources |
+| 7 | `xrddata/` unified store: `database.py` (index schema + `XRDDatabase` resolver) and per-source normalizers into canonical `.xy`/`.cif` + one `index.csv` (RRUFF first, opXRD second, lab third) |
+| 8 | `audit.py` wavelength + quality pass over the store (incl. the TOF wavelength carve-out and `n_phases` multi-phase flagging) |
 | 9 | `crystal_browser.py` Gradio app |
 | 10 | `pattern_browser.py` Gradio app |
 
