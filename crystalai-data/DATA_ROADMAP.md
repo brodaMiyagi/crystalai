@@ -197,51 +197,58 @@ All structure iterators yield pymatgen `Structure` objects (disorder preserved),
 
 Experimental data **is** centralized, into a common store inside `crystalai-data` (the `xrddata` subpackage). This reverses the earlier per-source-index design: at ~5k patterns the fork-memory argument that drove §1's SQLite-blob choice does not apply, and a single normalized store is what a common DataLoader and the matched-sample CIF lookup (`DESIGN_DECISIONS.md` §6) both need. The store keeps every pattern as **canonical text files** (`.xy` for patterns, `.cif` for structures) as the source of truth — nothing is resampled or re-binned at ingest, so the normalization is lossless and every file stays openable for manual investigation. A single unified `index.csv` carries the metadata and the file pointers (CSV, not SQLite: at ~5k rows the index loads once into a DataFrame and is served from memory, so there is no random-access-across-processes problem to solve and CSV stays the lighter, greppable choice).
 
-**Native format is preserved; all preprocessing is deferred to the consumer's `__getitem__`.** Patterns are stored in the coordinate they arrive in (2θ for angle-dispersive lab/synchrotron data); since the wavelength is in the index, the conversion to d / log-d and the binning happen on-the-fly in `CrystalAI-methods`' `experimental_dataset.py`. Background subtraction is likewise done downstream when `bgsub` is absent.
+**Native format is preserved; all preprocessing is deferred to the consumer's `__getitem__`.** Patterns are stored in the coordinate they arrive in (2θ for angle-dispersive lab/synchrotron data); since the wavelength is in the index, the conversion to d / log-d and the binning happen on-the-fly in `CrystalAI-methods`' `experimental_dataset.py`.
+
+**Background subtraction.** A source's own curated background-subtracted profile (e.g. RRUFF's `XY_Processed`) is stored verbatim as `bgsub.xy` with `autobg=0`. For every pattern that ships none (all opXRD, ~1,773 RRUFF), `background.py` precomputes one with a pybaselines auto-background (arPLS, GSAS-II AutoBkg style), written to `bgsub_autobg.xy` with `autobg=1`. Validated against RRUFF ground truth, the auto-corrected profile correlates ~0.996 with RRUFF's expert subtraction. `auto_background()` is a reusable primitive — `CrystalAI-methods` can call it on-the-fly instead of reading the precomputed file. Run order is ingest → ingest → `background.py` (an ingester rewrites its source's rows and would drop the `autobg` fill).
 
 > **Deferred optimization (note, not built).** If on-the-fly conversion in `__getitem__` proves too slow, add a second pair of preprocessed files per pattern — the binned profile view and the binned peak view, both as `.xy` — to the store, and have the Dataset prefer them when present. Not needed at ~5k patterns; revisit only if profiling shows the conversion dominating DataLoader time.
 
 ### Sources
 
-| Source | Size | Labels | Wavelength | Notes |
+| Source | Size (ingested) | Labels | Wavelength | Notes |
 |--------|------|--------|------------|-------|
-| RRUFF | ~3,000 | Full CIF for most | Cu Kα (mostly) | Separate raw and processed (background-subtracted) xy folders; some entries carry refinement folders with phase/structure and peak positions. Files are uniquely named and serve as identifiers |
-| opXRD-labeled | ~1,000 | Full structure labels | Mixed (Cu, Mo, Co, synchrotron) | Zenodo opXRD release (CNRS & HKUST). One JSON per pattern; a `phases` key carries the CIF/structure information |
-| Internal lab | <1,000 | Variable (some CS-only, some full CIF) | Cu Kα, Mo Kα | STADI-P / STADI-MP instruments |
+| RRUFF | 3,002 | SG + cell + formula + peaks (**no atomic-coordinate CIF**) | Cu Kα (mostly) | Separate `XY_RAW` / `XY_Processed` (background-subtracted) folders; the `DIF` file supplies wavelength, space-group H-M symbol, refined cell, and the 2θ/intensity peak list. The dump ships **no** atomic positions anywhere (the DIF only references a published structure), so rows are labels-only: `cif_path`/`cif_id` null. RRUFF id (e.g. `R080016-1`) is the identifier |
+| opXRD-labeled | 1,572 | Full structure (lattice + basis) → CIF; **space group derived** (spglib) | Mixed (Cu, Mo, Co, synchrotron) | Zenodo opXRD release (CNRS 1,052 + HKUST-A 21 + HKUST-B 499). One JSON per pattern; a `phases` key carries lattice + atomic basis (rebuilt into `structure.cif`). The JSON ships **no** space group (P1-expanded), so SG is *derived* via `SpacegroupAnalyzer` under the symprec-consensus carve-out — 907 of 912 structures resolved, the rest left null. Coincident P1-expansion sites are merged into disordered sites (occupancies renormalized) so CIFs stay valid. HKUST-B (499) carry **no phase at all** — ingested as unlabelled (pattern + wavelength only). ~161 CNRS phases give a lattice but no basis (cell recorded, no CIF) |
+| Internal lab (RWTH-A) | 80 (of 82) | SG + cell + formula, **matched to ICSD** | Cu Kα1 1.54056, Mo Kα1 0.70930 | STADI-P/STADI-MP. One label CSV + a `backgroud_files/<ID>_xy.csv` per pattern holding `y_obs` (raw) and a **manually-defined, verified** `y_bkg` (native background → `bgsub`, `autobg=0`). Each row's **ICSD Collection Code resolves to a `cif_id` in `crystals.sqlite`** (the matched-sample gold link) and supplies the authoritative formula. **2 rejected** (ML67, ML71) for fishy ICSD codes (non-ICSD / multi-phase-unidentified). SG read from CSV, CS via `sg_to_cs`; EXPO structure-solution predictions in the CSV are ignored |
 
-**Total: ~5k labeled experimental patterns.** ~90% have full CIFs, enabling matched-sample contrastive alignment (see `DESIGN_DECISIONS.md` §6).
+**Ingested so far: 4,654 experimental patterns** (3,002 RRUFF + 1,572 opXRD + 80 RWTH-A lab). Matched-sample structure access differs by source: opXRD carries its own `structure.cif` (912), while RWTH-A links to ICSD structures already in `crystals.sqlite` via `cif_id` (80) — the cleanest matched-sample case, an experimental pattern paired with its verified ICSD phase. RRUFF contributes rich scalar labels (SG/CS/cell/formula/peaks) without atomic positions. The original design's "~90% have full CIFs" assumption did **not** survive contact with the actual dumps — RRUFF ships no coordinates and opXRD ships no space groups — so matched-sample alignment (`DESIGN_DECISIONS.md` §6) keys on whatever a pattern actually carries (`cif_id` structure, own `structure.cif`, else SG/CS/cell), and the wavelength audit + label-presence filters decide per-pattern eligibility.
 
 The 91k uncurated opXRD pool is **not used** in this iteration — see `DESIGN_DECISIONS.md` §6.
 
 ### Store layout
 
+The ingest *code* lives in the package (`src/crystalai_data/xrddata/`); the *store* itself lives at the package root in `exp_data/` — gitignored (large; published to HuggingFace separately, link in the README) and resolved by `database.default_store()` or the `EXP_DATA_FOLDER` env key.
+
 ```
-src/crystalai_data/
-├── __init__.py
-├── crystals/                    # ICSD + MP-20 path (see §1)
-│   ├── database.py              # SQLite + Structure serialization
-│   ├── convert_icsd.py          # ICSD CIF → SQLite
-│   ├── convert_mp20.py          # MP-20 train/val/test CSVs → SQLite
-│   ├── symmetry.py              # SG↔CS↔symbol lookup utilities (no spglib)
-│   └── api.py                   # CrystalDatabase query class
-├── xrddata/
-│   ├── __init__.py
-│   ├── database.py              # XRDDatabase: unified index (CSV) + pattern-file resolver
-│   ├── ingest_rruff.py          # RRUFF folders → canonical files + index rows
-│   ├── ingest_opxrd.py          # opXRD JSON    → canonical files + index rows
-│   ├── ingest_lab.py            # STADI raw     → canonical files + index rows
-│   ├── audit.py                 # wavelength + quality audit
-│   └── store/
-│       ├── index.csv            # unified index (one row per pattern)
-│       └── patterns/
-│           └── <source>/<source_id>/
-│               ├── raw.xy       # as-measured, native coordinate (required)
-│               ├── bgsub.xy     # background-subtracted (absent ⇒ null)
-│               ├── peaks.xy     # peak list in the SAME coordinate as raw (absent ⇒ null)
-│               └── structure.cif# phase(s); multi-block CIF if >1 phase (absent ⇒ null, or cif_id → crystals.sqlite)
-└── visualization/
-    ├── crystal_browser.py       # Gradio app for CIF browsing
-    └── pattern_browser.py       # Gradio app for experimental pattern viewing
+crystalai-data/
+├── exp_data/                    # STORE (gitignored; HuggingFace-published)
+│   ├── index.csv                # unified index (one row per pattern)
+│   └── patterns/
+│       └── <source>/<source_id>/
+│           ├── raw.xy             # as-measured, native coordinate (required)
+│           ├── bgsub.xy           # native/curated background-subtracted (autobg=0; absent ⇒ null)
+│           ├── bgsub_autobg.xy    # pybaselines auto-background (autobg=1; absent ⇒ null)
+│           ├── peaks.xy           # peak list in the SAME coordinate as raw (absent ⇒ null)
+│           └── structure.cif      # phase(s); multi-block CIF if >1 phase (absent ⇒ null, or cif_id → crystals.sqlite)
+└── src/crystalai_data/
+    ├── __init__.py
+    ├── crystals/                # ICSD + MP-20 path (see §1)
+    │   ├── database.py          # SQLite + Structure serialization
+    │   ├── convert_icsd.py      # ICSD CIF → SQLite
+    │   ├── convert_mp20.py      # MP-20 train/val/test CSVs → SQLite
+    │   ├── symmetry.py          # SG↔CS↔symbol lookup utilities (no spglib)
+    │   └── api.py               # CrystalDatabase query class
+    ├── xrddata/
+    │   ├── __init__.py
+    │   ├── database.py          # XRDDatabase: unified index (CSV) + pattern-file resolver + writers
+    │   ├── ingest_rruff.py      # RRUFF folders → canonical files + index rows
+    │   ├── ingest_opxrd.py      # opXRD JSON → canonical files + rows (+ spglib SG derivation)
+    │   ├── background.py        # pybaselines auto-background: auto_background() + store pass
+    │   ├── audit.py             # wavelength audit → `audit` verdict column
+    │   └── ingest_lab.py        # RWTH-A lab CSV → canonical files + index rows (+ ICSD cif_id link)
+    └── visualization/
+        ├── crystal_browser.py   # Gradio app for CIF browsing
+        └── pattern_browser.py   # Gradio app for experimental pattern viewing
 ```
 
 Each source's `ingest_*.py` normalizes into this one layout: it extracts the pattern (from opXRD's JSON, RRUFF's xy folders, the STADI raw) into `raw.xy` / `bgsub.xy`, the structure (opXRD's `phases` entry, RRUFF's refinement CIF) into `structure.cif`, and the peak list into `peaks.xy` — writing text files verbatim in their native coordinate, never resampling. The canonical files are the source of truth; the index is rebuildable from them.
@@ -254,9 +261,10 @@ One row per pattern in `store/index.csv`. File paths are relative to `store/`.
 |--------|------|-------------|
 | `id` | int | Our stable internal id (default, autoincrement) — the primary handle downstream |
 | `source` | str | `'rruff'` \| `'opxrd'` \| `'lab'` |
-| `source_id` | str | RRUFF: `<rruff_id>`; opXRD: `opXRD_<opxrd_source>_<json_filename>`; lab: instrument+run id. `(source, source_id)` is unique |
+| `source_id` | str | RRUFF: `<rruff_id>`; opXRD: `opXRD_<opxrd_source>_<json_filename>`; lab: `RWTH-A_<ID>`. `(source, source_id)` is unique |
 | `raw_path` | str | As-measured `.xy` (required) |
-| `bgsub_path` | str | Background-subtracted `.xy`; null ⇒ absent, subtraction done in `__getitem__` |
+| `bgsub_path` | str | Background-subtracted `.xy` (native `bgsub.xy` or auto `bgsub_autobg.xy`); null ⇒ none |
+| `autobg` | int | Provenance of `bgsub_path`: 0 = native/curated, 1 = pybaselines auto-background; null ⇒ no bgsub |
 | `peaks_path` | str | Peak list `.xy`, positions in the **same coordinate as `raw`**; null ⇒ source ships no peaks |
 | `x_coord` | str | Native x-axis: `'two_theta'` \| `'d'` \| `'tof'` — drives the `__getitem__` conversion |
 | `wavelength_A` | float | Å; **nullable** — null for TOF (none yet). Required for angle-dispersive data |
@@ -270,6 +278,7 @@ One row per pattern in `store/index.csv`. File paths are relative to `store/`.
 | `cif_id` | int | Reference into `crystals.sqlite` when the structure coincides with an ICSD/MP entry (else null) |
 | `cif_path` | str | Standalone CIF in the store (RRUFF/opXRD phase), for structures not in `crystals.sqlite` (else null) |
 | `quality_flag` | str | `clean` \| `noisy` \| `multi_phase` \| `amorphous` |
+| `audit` | str | Wavelength-audit verdict (set by `audit.py`): `pass` \| `missing_wavelength` \| `suspicious_wavelength`; null until audited. Training filters to `pass` |
 | `notes` | str | Free-text notes from ingest |
 
 Atom-level detail (types, stoichiometry, **positions**) is reached through the CIF (`cif_id` first, then `cif_path`); `formula` is the queryable projection of types + stoichiometry, mirroring the crystals-side split where positions stay in the structure and scalars are exposed as columns. A row with both CIF pointers null is labels-only (CS/SG/cell/formula, no positions) or unlabelled. The six cell scalars are stored as columns because a labelled cell can exist without a refined structure, and because they are filterable without opening a CIF.
@@ -280,11 +289,13 @@ Source-specific columns (instrument ID, 2θ range, step size, etc.) can be added
 
 ### Wavelength audit
 
-Wavelength metadata accuracy is required for the wavelength-conditioning strategy (`DESIGN_DECISIONS.md` §1). `audit.py` runs over the store:
+Wavelength metadata accuracy is required for the wavelength-conditioning strategy (`DESIGN_DECISIONS.md` §1). `audit.py` runs over the store as a separate pass and writes a per-pattern `audit` verdict (so consumers filter on one column and the window can be retuned without re-ingesting):
 
-- For **angle-dispersive** patterns (`x_coord` ∈ {`two_theta`, `d`}): missing wavelength is disqualifying — flagged in `notes` and excluded from training. Suspicious wavelength (values outside [0.4, 2.5] Å, or inconsistent with the recorded instrument) is flagged for manual review.
-- For **TOF** patterns (`x_coord = 'tof'`): null wavelength is expected, not an error, and does not exclude the pattern. (TOF also has no FiLM wavelength input — handling deferred; none in the pool yet.)
-- Internal lab patterns are already annotated with wavelength (Cu Kα or Mo Kα per STADI-P / STADI-MP) — these need no audit beyond format validation.
+- For **angle-dispersive** patterns (`x_coord` ∈ {`two_theta`, `d`}): missing wavelength → `audit='missing_wavelength'`. Disqualifying for wavelength-conditioned training, but the pattern is **kept, not deleted** — it stays separable by this flag and reusable for the wavelength-sweep experiments (an angle-dispersive profile can be re-interpreted against assumed Cu/Mo/Co/… Kα lines to probe wavelength robustness). Wavelength outside the plausible window **[0.1, 2.6] Å** → `audit='suspicious_wavelength'`, flagged for manual review. The window's lower bound admits high-energy synchrotron (opXRD includes synchrotron sources, ~0.14 Å ≈ 87 keV); it was widened from an initial [0.4, 2.5] that mis-flagged ~42 legitimate short-λ synchrotron patterns.
+- For **TOF** patterns (`x_coord = 'tof'`): null wavelength is expected, not an error → `audit='pass'`, not excluded. (TOF also has no FiLM wavelength input — handling deferred; none in the pool yet.)
+
+On the current store the verdict is **4,145 `pass` / 428 `missing_wavelength` (236 RRUFF + 192 opXRD) / 1 `suspicious_wavelength`**. Multi-phase exclusion is a separate axis (`quality_flag='multi_phase'` / `n_phases`), not folded into `audit`.
+- Internal lab (RWTH-A) patterns carry wavelength from the `Radiation` field (Cu Kα1 1.54056 / Mo Kα1 0.70930 Å per STADI-P/STADI-MP) — all `audit='pass'`. Their background is manually defined and verified (`y_bkg`), so `bgsub` is native (`autobg=0`) and never auto-generated.
 
 ---
 
@@ -357,10 +368,13 @@ dependencies = [
     "py3dmol",                 # optional, for unit cell visualization
     "tqdm",
     "pyyaml",
+    "pybaselines>=1.1",        # auto-background (GSAS-II AutoBkg style) for experimental patterns
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 ```
 
-No `ase` dependency. No `Pysimxrd`. No `mp-api`. No `spglib` — space groups are read from the sources (CIF text / MP-20 CSV) and crystal systems derived from them, so no symmetry re-analysis is performed.
+No `ase`, `Pysimxrd`, or `mp-api`. `spglib` is not a declared dependency and is **not used on the crystals (ICSD/MP-20) path** — space groups there are read from the sources. It is reached transitively through pymatgen's `SpacegroupAnalyzer` for the *one* carve-out: deriving space groups of experimental **opXRD** patterns, which ship none (see §2 and `DESIGN_DECISIONS.md` §6). `pybaselines` is added for the auto-background primitive.
+
+On the crystals (ICSD/MP-20) path no symmetry re-analysis is performed — space groups are read from the sources (CIF text / MP-20 CSV) and crystal systems derived from them. The only symmetry derivation anywhere is the experimental opXRD SG carve-out described above.

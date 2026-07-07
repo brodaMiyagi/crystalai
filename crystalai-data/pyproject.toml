@@ -12,6 +12,7 @@ dependencies = [
     "py3dmol",
     "tqdm",
     "pyyaml",
+    "pybaselines>=1.1", # auto-background (GSAS-II AutoBkg style) for experimental patterns
 ]
 
 [build-system]

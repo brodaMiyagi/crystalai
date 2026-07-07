@@ -1,0 +1,9 @@
+# Experimental PXRD store — large, published to HuggingFace separately (see README).
+exp_data/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
