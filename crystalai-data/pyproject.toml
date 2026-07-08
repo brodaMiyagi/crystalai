@@ -13,6 +13,7 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "pybaselines>=1.1", # auto-background (GSAS-II AutoBkg style) for experimental patterns
+    "dash>=4.4.0",
 ]
 
 [build-system]

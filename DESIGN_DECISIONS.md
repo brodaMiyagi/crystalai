@@ -105,6 +105,18 @@ Ignoring wavelength and relying on augmentation alone (the maximally aggressive 
 
 **Conditions to revisit.** If GRU or Transformer ablations show that their respective injection mechanisms underperform FiLM-equivalent setups on CNN, the comparison is unfair and the injection mechanism becomes the confound. (This is the main reason to keep the ablations *logged* but secondary.)
 
+### 4a. Noise-floor conditioning: `(λmax, σrel)` as a second global input
+
+**Decision.** The encoder is conditioned not only on wavelength but on a **noise-floor pair `(λmax, σrel)`**, injected the same way (FiLM γ/β for the CNN; token/hidden-state for the ablations). `λmax` quantifies the counting-statistics level (Poisson; effectively the inverse relative background level — small = few counts = noisy), `σrel` the baseline Gaussian noise. Both are made a *closed loop* between simulation and experiment: the simulator samples `(λmax, σrel)`, applies the matching noise (`SIMXRD_ROADMAP.md` §5 #7–8), and emits them as conditioning; the experimental loader computes the *same two numbers* from each real pattern's low-intensity/background regions. Sim and real therefore carry an identical, physically-meaningful noise descriptor. Parameterization and ranges follow AlphaDiffract (Argonne, arXiv:2603.23367): `λmax ~ U(1,100)`, `σrel ~ U(1e-3,1e-1)`.
+
+**Problem it solves.** In background-subtracted data the noise floor is set by the *pre-subtraction* raw+background counts (residual variance ≈ `√(peak+bkg)`), so weak, **sharp counting-noise spikes are easily mistaken for real peaks** — a failure observed directly in the experimental patterns. Normalization (max/area/√) deliberately discards absolute scale, which is exactly the information that says "a bump this sharp, at this noise floor, is / isn't a peak." Feeding `(λmax, σrel)` back restores that context: the model can learn a noise-floor-aware peak/noise decision instead of over-reading sharp noise. This is the conditioning analogue of the wavelength decision above — a global scalar the encoder needs throughout the hierarchy, not at the readout.
+
+**Why `(λmax, σrel)` rather than raw max-intensity / max-background.** They are dimensionless and normalization-invariant, so they transfer across instruments and are directly reusable as the simulator's noise parameters (the raw maxima are the same information in scale-dependent form). Both are stored/derivable in `crystalai-data`; the experimental noise descriptor is computed from `raw.xy` + the background estimate (native `y_bkg` or the arPLS baseline).
+
+**Cross-package.** This spans all three packages and must stay consistent: **data** exposes/derives `(λmax, σrel)` per experimental pattern; **simxrd** samples them, applies the noise, and emits them on `SimulatedPattern`; **methods** adds them to the encoder's conditioning input (a two-scalar extension of the FiLM conditioning vector, `[wavelength, λmax, σrel]`). The Section-4 canary generalizes: CS accuracy should be independent of the noise floor as well as wavelength.
+
+**Conditions to revisit.** If the noise-floor descriptor proves hard to estimate reliably on real patterns (background-region identification ambiguous), fall back to conditioning on wavelength alone and lean on noise augmentation for robustness — but the closed-loop descriptor is preferred precisely because it makes the sim→real noise model checkable.
+
 ---
 
 ## 5. Classification firewall: detached probe with metered gradient leak
@@ -276,6 +288,35 @@ The roles for peak-position augmentation in the new design are (a) feeding the V
 - **Gap compression.** A from-scratch generator on a low-entropy small-cell subset can learn a strong *unconditional* prior, lifting both B1 and B2 on the prior alone and shrinking the conditioning lift the paper depends on. Monitor the unconditional-vs-conditioned gap; if it compresses, audit conditioning strength before trusting the B1→B2 comparison.
 - **Conditioning failure.** If B2 (frozen A2 encoder + fresh generator) fails to beat B1, the suspect is the encoder, not an adapter mismatch (there is no adapter). Unfreeze the A2 projection heads (not the trunk) and re-run; if that fails, the encoder side needs reconsideration.
 - **Worst case.** If neither B1 nor B2 reaches a useful generation baseline, the paper falls back to Track A alone (classification + representation learning) with Track B as future work — consistent with the validate-before-stacking philosophy.
+
+---
+
+## 9. Simulation precompute boundary: cache Bragg peaks (Track A) vs full on-the-fly (Track B)
+
+**Decision.** Training-time PXRD simulation is split at the Bragg peak list. For **Track A** (full ICSD, ~212k structures) the wavelength-independent d-space reflection list `{d, |F|²}` is **precomputed once per structure** and cached; the DataLoader then applies wavelength, Lorentz-polarization, Debye-Waller, Caglioti broadening, convolution, background, and augmentations on-the-fly. For **Track B** (generation, structures ≤ 20 atoms; Section 2, Section 8) even the Bragg step is cheap enough to run **fully on-the-fly** — which additionally opens structure-level augmentation (perturbing the crystal itself). The full engineering detail lives in `crystalai-simxrd/SIMXRD_ROADMAP.md` §1 ("Precompute vs on-the-fly"); this section records *why* the line sits where it does, and why it lands differently for the two tracks.
+
+**The measurement.** The ICSD size distribution is extremely heavy-tailed and Bragg structure-factor cost scales super-linearly with size (`O(N_reflections × n_sites)`, ~`n_sites^{1.5}` empirically over the sampled range). Measured over the 211,879 ICSD structures and benchmarking the from-scratch engine (`crystalai-difsim`) at the production d-window [0.7, 8] Å:
+
+| quantity | value |
+|---|---|
+| `n_atoms` — median / p90 / p99 / max | 28 / 116 / 548 / **23,134** |
+| `n_sites` — median / p90 / p99 / max | 30 / 124 / 606 / **23,704** |
+| fraction of ICSD with ≤ 20 atoms | **39.5%** |
+| Bragg time: median structure (~30 sites) | ~16 ms |
+| Bragg time: p99 structure (~600 sites) | ~5 s |
+| Bragg time: largest cells | seconds → minutes (OOM) |
+
+![ICSD structure-size long tail and Bragg cost vs size](figures/simxrd_longtail_precompute.png)
+
+**Why precompute is forced for Track A — the tail, not the median.** A DataLoader feeding 8 GPUs needs O(10³) patterns/s, i.e. a budget of tens of ms per worker per pattern. The median ICSD structure (~16 ms) is already marginal, but the killer is the tail: random batch sampling hits large-cell structures every batch, and a single multi-second structure stalls a worker for the equivalent of ~100 patterns. Vectorizing the per-site scattering loop (a straightforward 5–10× win) fixes the median but not the tail. So Track A cannot compute Bragg on-the-fly; the peak list must be cached. Everything downstream operates on a bounded peak list (`O(N_peaks)`, flat across structure size) and stays on-the-fly.
+
+**Why the cache costs nothing in augmentation diversity.** In d-space the Bragg peak list is **wavelength-independent**: Bragg ties θ and λ through `sinθ/λ = 1/(2d)`, so peak positions `d`, scattering factors `f(1/2d)`, Debye-Waller, and `|F|²` all depend only on `d`, never on λ. The only wavelength-dependent steps — θ-mapping, `LP(θ)`, Caglioti FWHM, and the accessible d-window — stay on-the-fly. Precomputing the peak list therefore preserves the *load-bearing* wavelength randomization (Section 1, Section 4) in full; it is the exact factoring the physics permits, not a compromise.
+
+**Why Track B is different — and an opportunity.** Track B trains the generator on the redistributable ≤ 20-atom subset (MP-20, and the ICSD `n_atoms_le_20` pool; Section 2). Every such structure lives in the cheap head of the distribution (left of the green line in the figure): ~1–20 ms per Bragg computation, no tail. So for Track B the simulator can run **end-to-end on-the-fly, Bragg included**, with no precompute cache needed. This is not merely "also fine" — it enables a distinct class of augmentation: because the structure is re-simulated from scratch each `__getitem__`, the **crystal structure itself can be perturbed** before diffraction (small atomic displacements, lattice strain, mild occupancy/thermal jitter), producing physically-grounded pattern variation that a fixed peak-list cache cannot. For a generation track this structure-space augmentation is well-matched to the objective. It is offered as an **option**, with the usual guard: perturbations must stay physical and must not silently change the symmetry label the pattern is trained against (e.g. a strain that breaks the space group would corrupt the SG target) — so any such augmentation is bounded and, where it could alter symmetry, either rejected or the label recomputed.
+
+**Alternatives considered.** (i) *Pure on-the-fly for both tracks* — rejected for Track A on the tail argument above. (ii) *Precompute full convolved patterns* — rejected: it bakes in wavelength/Caglioti and destroys the on-the-fly augmentation envelope (the peak list is the maximal wavelength-independent precomputation). (iii) *257k individual peak files* — rejected for the training DataLoader in favour of a fork-safe blob store keyed by `cif_id`, the same random-access-across-processes argument the crystals DB made against per-row files (`DATA_ROADMAP.md` §1); individual files remain fine for exploration.
+
+**Conditions to revisit.** If the structure-factor engine is optimized enough that even the p99.9 tail fits the per-worker budget, Track A on-the-fly becomes reconsiderable — but the cache is cheap (~2–3 GB, ~1–2 h one-time) and removes the tail risk entirely, so precompute stands as the default.
 
 ---
 

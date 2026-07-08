@@ -248,7 +248,7 @@ crystalai-data/
     │   └── ingest_lab.py        # RWTH-A lab CSV → canonical files + index rows (+ ICSD cif_id link)
     └── visualization/
         ├── crystal_browser.py   # Gradio app for CIF browsing
-        └── pattern_browser.py   # Gradio app for experimental pattern viewing
+        └── pattern_browser.py   # Dash app: index table + 2θ/log-d side-by-side viewer (built)
 ```
 
 Each source's `ingest_*.py` normalizes into this one layout: it extracts the pattern (from opXRD's JSON, RRUFF's xy folders, the STADI raw) into `raw.xy` / `bgsub.xy`, the structure (opXRD's `phases` entry, RRUFF's refinement CIF) into `structure.cif`, and the peak list into `peaks.xy` — writing text files verbatim in their native coordinate, never resampling. The canonical files are the source of truth; the index is rebuildable from them.
@@ -301,7 +301,7 @@ On the current store the verdict is **4,145 `pass` / 428 `missing_wavelength` (2
 
 ## 3. Visualization apps
 
-Two Gradio-based apps live in `src/crystalai_data/visualization/`. They are intended for exploratory use during data preparation and for consortium demos, not for training-time inspection.
+Two apps live in `src/crystalai_data/visualization/`, for exploratory use during data preparation and consortium demos, not for training-time inspection. The pattern browser is a **Dash** app (below); the crystal browser is planned as Gradio.
 
 ### Crystal browser (`crystal_browser.py`)
 
@@ -311,14 +311,17 @@ Loads `crystals.sqlite` and provides:
 - Per-structure view: unit cell visualization (via py3Dmol), CIF text dump, simulated PXRD preview (lightweight call into `CrystalAI-simXRD`).
 - Distribution plots: CS histogram, SG histogram (with a 230-bar option), atom count distribution, volume distribution.
 
-### Pattern browser (`pattern_browser.py`)
+### Pattern browser (`pattern_browser.py`) — **built (Dash)**
 
-Loads the unified experimental index (`store/index.csv`) and provides:
+A **Dash** app (Dash suits the table-driven browse-and-select flow better than Gradio) that loads the unified index (`exp_data/index.csv`) and provides:
 
-- Source / label filtering.
-- Per-pattern view: 2θ-I and log-d-I overlay (converting from the stored native coordinate via `wavelength_A`), raw vs background-subtracted toggle, peak-position overlay where available, metadata panel.
-- Side-by-side comparison: experimental vs simulated (the latter via `CrystalAI-simXRD` if `cif_id` or `cif_path` is non-null).
-- Distribution plots over the experimental pool: wavelength distribution per source, CS distribution among labeled, instrument distribution.
+- A filterable/sortable index **DataTable** (dropdowns for source / audit / quality, plus the table's native per-column filters); single-row selection drives the view.
+- Per-pattern view: **2θ and log-d shown side by side** (separate x-axes — high 2θ ⇒ low d, and the ranges differ, so a shared axis would mislead), converting via Bragg `d = λ/(2 sinθ)`, `log₁₀(d/Å)`. Raw / bgsub / both toggle, peak-position stems where available, and a **wavelength override** (renders log-d for `missing_wavelength` patterns against an assumed Kα — the wavelength-sweep use case).
+- Essential-metadata panel (labels, cell, provenance, `cif_id`, audit, notes).
+
+Pure helpers (`filter_records`, `two_theta_to_log_d`, `make_figure`, `metadata_rows`) are separated from the Dash wiring so the conversion/figure logic is testable without a server. Run: `uv run python -m crystalai_data.visualization.pattern_browser [--port N]`.
+
+Deferred (not built here): experimental-vs-simulated side-by-side (needs `CrystalAI-simXRD`, a downstream import the data package must not take) and pool-level distribution plots.
 
 ---
 
@@ -346,7 +349,7 @@ There is no other coupling. Each downstream repo imports `crystalai_data` and us
 | 7 | `xrddata/` unified store: `database.py` (index schema + `XRDDatabase` resolver) and per-source normalizers into canonical `.xy`/`.cif` + one `index.csv` (RRUFF first, opXRD second, lab third) |
 | 8 | `audit.py` wavelength + quality pass over the store (incl. the TOF wavelength carve-out and `n_phases` multi-phase flagging) |
 | 9 | `crystal_browser.py` Gradio app |
-| 10 | `pattern_browser.py` Gradio app |
+| 10 | `pattern_browser.py` Dash app (index table + 2θ/log-d side-by-side viewer) — **built** |
 
 Steps 1–6 should be fully tested before downstream repos start consuming the API.
 
@@ -363,7 +366,8 @@ dependencies = [
     "numpy>=1.24",
     "pandas>=2.0",             # read_sql_query ergonomics, metadata frames
     "pymatgen>=2024.1",
-    "gradio>=4.0",
+    "dash",                    # pattern_browser (table-driven experimental viewer)
+    "gradio>=4.0",             # planned crystal_browser
     "plotly>=5.15",
     "py3dmol",                 # optional, for unit cell visualization
     "tqdm",
