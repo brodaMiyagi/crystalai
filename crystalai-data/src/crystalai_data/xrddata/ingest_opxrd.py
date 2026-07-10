@@ -371,7 +371,7 @@ def convert(*, subsources: list[tuple[str, Path]], store: Path, limit: int | Non
 def main(argv: list[str] | None = None) -> None:
     root = repo_root()
     env = load_dotenv(root / ".env")
-    store_default = env.get("EXP_DATA_FOLDER", str(db.default_store()))
+    store_default = str(db.resolve_store(env, root))
 
     p = argparse.ArgumentParser(description="Ingest opXRD into the experimental store")
     p.add_argument("--store", default=store_default, type=str)

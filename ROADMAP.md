@@ -37,7 +37,7 @@ Files flow strictly downstream: `data` produces curated CIFs and experimental pa
 Full diffraction pattern (log-d binned, background-removed) → encoder (no-pool log-d CNN primary; bidirectional GRU and lightweight Transformer as logged ablations) → CS classification head + CS-gated SG classification head. Wavelength injected via FiLM (CNN) or equivalent per architecture. Trained on simulated patterns + ~5k labeled experimental.
 
 **Phase A2: Multimodal.**
-Add a peak-position encoder (no-pool log-d CNN with dilated convolutions for spacing-relational sensitivity). VICReg alignment between the two encoders' z_lattice projections. Classification firewall via a detached probe with a small metered gradient leak. Importance-aware peak-position augmentation. Trained on the same data as A1; comparison is against A1 on the same evaluation set.
+Add a peak-position encoder (no-pool log-d CNN with dilated convolutions for spacing-relational sensitivity). VICReg alignment between the two encoders' z_lattice projections. Classification firewall via a detached probe with a small metered gradient leak. The peak-list view is augmented to model the hand-picked inference input (selection jitter + off-center, guarded low-d dropping, spurious peaks — commitment #7). Trained on the same data as A1; comparison is against A1 on the same evaluation set.
 
 ### Track B — Generation (from-scratch flow generator)
 
@@ -61,7 +61,7 @@ These are settled. Each carries rationale and trade-offs in `DESIGN_DECISIONS.md
 4. **Wavelength injection mechanism: FiLM** (CNN primary), prepended token (Transformer ablation), initial hidden state (GRU ablation).
 5. **Experimental data: ~5k labeled patterns only.** RRUFF (~3k) + opXRD-labeled (~1k) + internal lab (<1k). The 91k uncurated opXRD pool is dropped. Supervised fine-tuning with matched-sample contrastive alignment replaces unsupervised Sinkhorn DA.
 6. **Track A multimodal alignment: VICReg between profile and peak views; classification firewall via detached probe** with a small metered gradient leak.
-7. **Peak-position augmentation: importance-aware** — protect high-2θ / low-d peaks (lattice-pinning), and hard-reject any augmentation that fabricates systematic absences.
+7. **Peak-list augmentation models the human-picked input** — the profile view keeps exact positions (only a global instrument zero-shift), while the manually-picked peak-list view is augmented for human error: small selection jitter + off-center bias, and selective dropping of low-d (high-2θ) peaks when peak-dense, guarded by a manufactured-absence check so the retained high-d peaks still determine the SG. Additive spurious peaks too. (Deliberately trades some lattice precision for fidelity to the real hand-picked input.) See `DESIGN_DECISIONS.md` §7.
 8. **Generator backbone: trained from scratch; encoder frozen.** Track B trains a flow generator (FlowMM/DiffCSP-class small equivariant GNN) from scratch on the ≤20-atom structure subset, conditioned on the frozen Track-A encoder. Only the generator trains in Track B (encoder frozen, never co-trained). A frozen *pretrained* generator was rejected: it would lock in its own training-set structure prior and its own encoder's conditioning space, neither compatible with our target structures or log-d multi-source encoder. The per-run cost (~1 day on a 24 GB card for this model class) fits the ≤1-week budget, so from-scratch is in scope.
 
 ---

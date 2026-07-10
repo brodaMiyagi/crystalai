@@ -8,7 +8,7 @@ The decisions are presented in order of *foundational dependency* — choices ma
 
 ## 1. Encoder input coordinate: log(d-spacing)
 
-**Decision.** All training and inference PXRD patterns are binned uniformly in log(d) over a fixed d-window (default 0.7 Å to 8 Å, ~4000 bins). The wavelength is provided as an explicit input alongside the binned pattern.
+**Decision.** All training and inference PXRD patterns are binned uniformly in log(d) over a fixed d-window: **d ∈ [0.7, 18] Å, 12,000 bins** (Δlog-d/bin ≈ 1.1×10⁻⁴). The wavelength is provided as an explicit input alongside the binned pattern. The window and bin count are set empirically (§1b); the earlier 0.7–8 Å / 4000-bin placeholder was too narrow (it truncated the first reflection of ~70% of ICSD) and too coarse (it undersampled the real 0.010° data).
 
 **Alternatives considered.** Uniform binning in 2θ; uniform binning in linear d.
 
@@ -27,6 +27,28 @@ D-spacing is the wavelength-independent reciprocal of the diffraction vector (`d
 **Cost.** Implementation overhead is small: `np.logspace` instead of `np.linspace` for the binning grid; one extra factor of d in the Jacobian when converting from 2θ; trivial changes to positional encoding if a Transformer is used.
 
 **Conditions to revisit.** If wavelength metadata becomes unreliable enough that the explicit-wavelength conditioning breaks down (significantly mislabeled training data), or if the downstream generator turns out to need linear-d / 2θ input and the conversion at the encoder boundary becomes the bottleneck.
+
+### 1a. Simulation domain: build the pattern in 2θ, convert to log-d once (constant-wavelength)
+
+**Decision.** log(d) is the coordinate the *encoder* sees (§1), not where the pattern is *computed*. For constant-wavelength (CW / angle-dispersive) sources — the only kind in scope now — the simulator assembles the full pattern **in 2θ**, applies every instrument/physical effect there, then does a **single conversion to log-d at the end** (with normalization and the relative-noise augmentation following in log-d). TOF / neutron sources, if added later, get their own native strategies (d-space / Ikeda-Carpenter), not this path.
+
+**Reasoning.** The detailed CW effects are 2θ-geometry or detector physics and are only cleanly expressible in 2θ: axial-divergence asymmetry (worst at low 2θ), slit response, and zero-shift are instrument-geometry; **background** is an instrument/scattering effect measured in 2θ; and **counting (Poisson) noise** is detector statistics on the total 2θ counts (profile + background — you cannot apply counting noise before the background is present). Representing each as a native-log-d kernel would need per-effect Jacobian-warped asymmetric kernels — messy and approximate. Building in 2θ (where the physics lives) and converting once is exact and mirrors how the instrument actually measures. Because peak widths are ≈ uniform in log-d (the property that motivates the coordinate, §1), the converted pattern still has near-constant width, so the log-d encoder rationale is fully preserved — only the *construction* is in 2θ.
+
+**Pipeline consequence** (the canonical order; `SIMXRD_ROADMAP.md` §5): assemble the full 2θ pattern (per-peak TCH-PV ⊗ axial-divergence ⊗ slit, + global zero-shift) → **add background (2θ)** → **Poisson counting noise (2θ)** → **convert to log-d** → normalize → relative Gaussian noise. Only the relative Gaussian noise and normalization live in log-d — they are model-input-space operations, not raw instrument physics. A single-kernel native-log-d convolution is retained only as a fast approximate preview preset. (This is the same 2θ-then-convert flow as Pysimxrd — a banned dependency, reference only — except we convert to log-d, not linear-d.)
+
+**Conditions to revisit.** Adding a non-CW source (TOF, energy-dispersive) breaks the "2θ is the instrument's native domain" premise; those sources simulate in their own native coordinate and convert to log-d separately.
+
+### 1b. The log-d window and bin count: d ∈ [0.7, 18] Å, 12,000 bins
+
+**Decision.** The fixed log-d window is **[0.7, 18] Å** with **12,000 uniform bins**. Each of the three numbers is set from data, not convenience.
+
+- **d_max = 18 Å.** The largest d-spacing (first reflection) per ICSD structure is heavy-tailed — extinction-aware median 6.9 Å, but p90 ≈ 19.6, p95 ≈ 24.2, p99 ≈ 38.6 Å. Independently, experimental patterns reach a **median d of 17.7 Å** (2θ_min ≈ 5° at Cu; 90% reach ≥15 Å, only ~20% beyond 20 Å). 18 Å sits at that experimental reach and captures the first reflection of **~87% of ICSD** outright. **Structures whose first reflection exceeds 18 Å are *not* discarded** — they keep their many in-window reflections (a large cell has a *dense* reciprocal lattice, so windowing clips only its 1–few largest-d peaks, exactly as a real 5°-start measurement would). Going higher (25 Å → 96% captured) mainly simulates a low-angle region most instruments never measure, *creating* a sim-real mismatch rather than removing one.
+- **d_min = 0.7 Å.** Only ~4% of experimental patterns reach below 0.7 Å (median low-d cutoff ≈ 1.09 Å, 2θ_max ≈ 90° at Cu); 0.7 covers all lab-Cu data plus the Mo/synchrotron short-λ tail. Lower buys little and enlarges the grid.
+- **n_bins = 12,000.** Matched to the **dominant experimental sampling step of 0.010° 2θ** (RRUFF + opXRD-HKUST-B ≈ 3,500 of 4,574 patterns), which over [0.7, 18] corresponds to ~12–13k log-d bins. Fewer (e.g. the old 4,000) *undersamples* real data; the ~40k needed to resolve sharp synchrotron peaks at 4 bins/FWHM is empty precision no instrument in the pool provides. Peaks that are ~1 sample wide in the real data are ~1 bin wide in sim — consistent. Paired with a **minimum Caglioti FWHM floor of ~0.02° 2θ** so no simulated peak is narrower than ~2 bins.
+
+**Consequence for matched-d-range simulation.** The `PRODUCTION` augmentation picks this [0.7, 18] window first; per sampled wavelength the corresponding 2θ range is simulated so every training pattern lands in the same log-d window after binning (`SIMXRD_ROADMAP.md` §5).
+
+**Conditions to revisit.** If a large fraction of *target* structures turn out to have their diagnostic low-angle reflections above 18 Å (very-large-cell regime), or if the encoder is bottlenecked by input length, revisit d_max / n_bins together (they trade off resolution against sequence length).
 
 ---
 
@@ -107,7 +129,10 @@ Ignoring wavelength and relying on augmentation alone (the maximally aggressive 
 
 ### 4a. Noise-floor conditioning: `(λmax, σrel)` as a second global input
 
-**Decision.** The encoder is conditioned not only on wavelength but on a **noise-floor pair `(λmax, σrel)`**, injected the same way (FiLM γ/β for the CNN; token/hidden-state for the ablations). `λmax` quantifies the counting-statistics level (Poisson; effectively the inverse relative background level — small = few counts = noisy), `σrel` the baseline Gaussian noise. Both are made a *closed loop* between simulation and experiment: the simulator samples `(λmax, σrel)`, applies the matching noise (`SIMXRD_ROADMAP.md` §5 #7–8), and emits them as conditioning; the experimental loader computes the *same two numbers* from each real pattern's low-intensity/background regions. Sim and real therefore carry an identical, physically-meaningful noise descriptor. Parameterization and ranges follow AlphaDiffract (Argonne, arXiv:2603.23367): `λmax ~ U(1,100)`, `σrel ~ U(1e-3,1e-1)`.
+**Decision.** The encoder is conditioned not only on wavelength but on a **noise-floor pair `(λmax, σrel)`**, injected the same way (FiLM γ/β for the CNN; token/hidden-state for the ablations). `λmax` quantifies the counting-statistics level (Poisson; effectively the inverse relative background level — small = few counts = noisy), `σrel` the baseline Gaussian noise. Both are made a *closed loop* between simulation and experiment: the simulator samples `(λmax, σrel)`, applies the matching noise (`SIMXRD_ROADMAP.md` §5), and emits them as conditioning; the experimental loader computes the *same two numbers* from each real pattern's low-intensity/background regions. Sim and real therefore carry an identical, physically-meaningful noise descriptor. Parameterization, ranges, and the noise model follow AlphaDiffract (Argonne, arXiv:2603.23367):
+
+- **Poisson** (counting noise, applied in 2θ on total counts = profile + background): `I_pois = max(I)/λmax · Poisson(λmax · I/max(I))`, `λmax ~ U(1, 100)`. Small `λmax` → few counts → sharp `√`-scaled spikes.
+- **Gaussian** (baseline/readout, applied in log-d after normalization): `+ N(0, σrel)`, `σrel ~ U(1e-3, 1e-1)`.
 
 **Problem it solves.** In background-subtracted data the noise floor is set by the *pre-subtraction* raw+background counts (residual variance ≈ `√(peak+bkg)`), so weak, **sharp counting-noise spikes are easily mistaken for real peaks** — a failure observed directly in the experimental patterns. Normalization (max/area/√) deliberately discards absolute scale, which is exactly the information that says "a bump this sharp, at this noise floor, is / isn't a peak." Feeding `(λmax, σrel)` back restores that context: the model can learn a noise-floor-aware peak/noise decision instead of over-reading sharp noise. This is the conditioning analogue of the wavelength decision above — a global scalar the encoder needs throughout the hierarchy, not at the readout.
 
@@ -223,43 +248,24 @@ Two decisions were forced by what the actual RRUFF/opXRD dumps contain (vs. what
 
 ---
 
-## 7. Peak-position augmentation: importance-aware
+## 7. Peak-list augmentation: model the human-picked input
 
-**Decision.** Peak-position augmentations respect the physical role of each peak in lattice and space-group determination. The previous "drop with probability proportional to weakness" rule is replaced with a three-component drop model (correlated-failure + high-information protection + baseline random) plus a hard-reject manufactured-absence guard, and the position-jitter magnitude is angle-aware (gentler at high 2θ where small δ does more damage).
+**Decision.** The two views the model consumes have different *position semantics* and are augmented accordingly:
 
-**Alternatives considered.** Uniform random drops; weakness-proportional drops (the original design); full Fisher-information weighting of every peak's marginal contribution.
+- **Full-profile view** — peak positions are the physical measurement; never per-peak perturbed. The only position effect is the global instrument **zero-shift** (whole-pattern 2θ offset; `SIMXRD_ROADMAP.md` §5). This channel carries complete, exact positions.
+- **Peak-list view** — at inference this is a list a user **picks by hand**, so it carries human error; we train on that error rather than on idealized-clean positions. Three effects: (1) **position error** — small per-peak selection jitter plus a small off-center bias (the click lands on the profile shoulder, not the exact centroid), sub-FWHM; (2) **selective low-d dropping** — humans keep the prominent low-2θ (high-d) peaks and skip much of the dense high-2θ (low-d) forest, so when a pattern is peak-dense, drop preferentially from the low-d / high-2θ end; (3) **spurious peaks** — 0–3 additive impurity peaks.
 
-**Reasoning.**
+**This corrects the earlier "positions never perturbed" stance,** which idealized the peak list as clean. The peak list is *human-generated at inference*; training the peak encoder on human-error-augmented lists is the sim-to-real match for this channel. (This is the "conditions to revisit" the previous version flagged — now invoked.)
 
-The roles for peak-position augmentation in the new design are (a) feeding the VICReg invariance term so z_lattice_peaks meaningfully aligns with z_lattice_profile, and (b) producing combined-mode robustness when a crystallographer supplies manually-verified peaks alongside a full profile. Both roles are degraded — not served — by indiscriminate weakness-proportional dropping.
+**Guard on dropping (manufactured-absence, reinstated).** Dropping is permitted only while the retained high-d peaks still determine the space group: never drop a reflection whose removal would fabricate a diagnostic systematic absence (implying a higher-symmetry SG). This implements the operator's condition "drop low-d peaks *if the high-d peaks are enough to predict the SG*," and it uses the systematic-absence physics below as the protection criterion.
 
-**Physics framing.**
+**Physics framing (now used to shape, not forbid, the augmentation).**
+- **Lattice from positions, tightest at high 2θ / low d** (fractional cell error ∝ cot θ·δ2θ; Nelson-Riley). So preferentially dropping low-d/high-2θ peaks — as humans do — **costs lattice precision** in `z_lattice_peaks`. This is a deliberate **reversal** of the old "protect high-2θ peaks" rule: we accept the cost because it matches the real manual input, and the profile view (complete, exact positions) carries the lattice-precision load in the VICReg-aligned pair.
+- **SG from systematic absences.** The SG signal is which reflections are present vs absent, concentrated in the reliably-observed low-angle peaks — which the human keeps and the drop guard protects. So SG determination survives the dropping that lattice precision partially pays for.
 
-- **Peak positions at high 2θ / low d constrain lattice parameters most tightly.** The fractional error in extracted lattice constants from a peak scales as cot(θ) · δ(2θ), so a high-angle peak pins the cell far more precisely than a low-angle one — the basis of Nelson-Riley extrapolation and the standard Rietveld preference for high-angle reflections in lattice refinement. High-order peaks are also often weak (form-factor falloff, Debye-Waller damping), so weakness-proportional dropping preferentially deletes the peaks carrying the most lattice information.
-- **Space-group determination depends on systematic absences.** The SG signal lives in *which* reflections are present vs absent (extinction conditions for screw axes and glide planes), not their precise positions. A *missed weak peak that is actually present* can be misread as a systematic absence and silently corrupt SG identification — the worst failure mode for SG-relevant signal, and the one uniform weakness-proportional dropping makes most likely.
+**Roles this serves.** The peak channel feeds (a) VICReg alignment of `z_lattice_peaks` with `z_lattice_profile`, and (b) combined-mode robustness when a crystallographer supplies hand-picked peaks. Both are served *better* by training on realistic human-error lists than on idealized-clean ones, because the latter is never the actual inference input.
 
-**Augmentation rules.**
-
-1. **Position jitter is angle-aware.** Per-peak jitter magnitude scales with local peak FWHM in log-d (approximately uniform under W1), with a floor preventing collapse at low d.
-2. **Drop probability is a three-component model.**
-   - *Correlated-failure*: when one peak is dropped, neighbouring peaks within a configurable log-d window receive elevated drop probability.
-   - *High-information protection*: peaks above a 2θ threshold (equivalently, below a d threshold) have drop probability multiplicatively capped.
-   - *Baseline random*: small uniform component for true random misses.
-3. **Manufactured-absence guard (hard reject).** After every augmentation draw, the resulting peak list is checked against the source CIF's extinction conditions. If any reflection removed is one whose presence is *diagnostic* for the true space group (i.e. its observation rules out a higher-symmetry alternative), the draw is rejected and resampled.
-4. **Spurious peaks unchanged.** Existing rule (0–3 random spurious peaks per pattern) retained.
-
-**Hyperparameter starting points.**
-
-| Parameter | Default | Range | Trade-off |
-|-----------|---------|-------|-----------|
-| High-information 2θ threshold | ~60° at Cu Kα equivalent (d ≲ 1.5 Å) | 50°–80° | Lower → larger protected set, weaker VICReg signal; higher → smaller protected set, more aggressive augmentation possible |
-| Drop-cap multiplier in protected region | 0.2× | 0.0×–0.5× | 0× = never drop high-order peaks (strongest protection, unrealistic) |
-| Correlated drop cluster radius (in log-d) | 0.05 (≈ one FWHM) | 0.02–0.10 | Larger → more strongly correlated drops (more realistic but more aggressive overall) |
-| Baseline random drop rate | 0.05 | 0.02–0.10 | Standard |
-
-**Caveat.** Weighting by 2θ/order is a heuristic for the principled quantity (each peak's marginal Fisher information for the cell parameters and extinction conditions). The principled version is computable from the CIF but adds machinery that may not be worth the cost at the augmentation stage. The heuristic above is the production rule; Fisher-information weighting is the rigorous fallback if the heuristic underperforms — diagnosed by VICReg alignment quality on held-out CIFs and downstream CS / lattice-extraction accuracy.
-
-**Conditions to revisit.** If VICReg alignment between z_lattice_profile and z_lattice_peaks plateaus, or if downstream CS accuracy via the peak encoder degrades, escalate to Fisher-information weighting.
+**Conditions to revisit.** If the position-error magnitude or drop rate is tuned too aggressively and VICReg alignment or peak-encoder SG accuracy degrades, dial them back toward the clean limit — but do not return to feeding perfectly-clean peak lists, which mismatches inference. Hyperparameters (jitter σ, off-center bias, drop rate, density threshold) are starting points to tune against held-out real hand-picked lists.
 
 ---
 
@@ -293,7 +299,7 @@ The roles for peak-position augmentation in the new design are (a) feeding the V
 
 ## 9. Simulation precompute boundary: cache Bragg peaks (Track A) vs full on-the-fly (Track B)
 
-**Decision.** Training-time PXRD simulation is split at the Bragg peak list. For **Track A** (full ICSD, ~212k structures) the wavelength-independent d-space reflection list `{d, |F|²}` is **precomputed once per structure** and cached; the DataLoader then applies wavelength, Lorentz-polarization, Debye-Waller, Caglioti broadening, convolution, background, and augmentations on-the-fly. For **Track B** (generation, structures ≤ 20 atoms; Section 2, Section 8) even the Bragg step is cheap enough to run **fully on-the-fly** — which additionally opens structure-level augmentation (perturbing the crystal itself). The full engineering detail lives in `crystalai-simxrd/SIMXRD_ROADMAP.md` §1 ("Precompute vs on-the-fly"); this section records *why* the line sits where it does, and why it lands differently for the two tracks.
+**Decision.** Training-time PXRD simulation is split at the Bragg peak list. For **Track A** (full ICSD, ~212k structures) the wavelength-independent d-space reflection list `{d, |F|²}` is **precomputed once per structure** and cached; the DataLoader then runs the rest live — wavelength, LP, Debye-Waller, Caglioti broadening, the 2θ profile build (with axial-divergence, slit, zero-shift, background, counting noise), the single log-d conversion, and augmentation (domain ordering per §1a). For **Track B** (generation, structures ≤ 20 atoms; Section 2, Section 8) even the Bragg step is cheap enough to run **fully on-the-fly** — which additionally opens structure-level augmentation (perturbing the crystal itself). Engineering detail (the `bragg_peaks` store, the batch precompute) is in `crystalai-simxrd/SIMXRD_ROADMAP.md` §2 and Phase 5.1; this section records *why* the line sits where it does, and why it lands differently for the two tracks.
 
 **The measurement.** The ICSD size distribution is extremely heavy-tailed and Bragg structure-factor cost scales super-linearly with size (`O(N_reflections × n_sites)`, ~`n_sites^{1.5}` empirically over the sampled range). Measured over the 211,879 ICSD structures and benchmarking the from-scratch engine (`crystalai-difsim`) at the production d-window [0.7, 8] Å:
 
@@ -317,6 +323,24 @@ The roles for peak-position augmentation in the new design are (a) feeding the V
 **Alternatives considered.** (i) *Pure on-the-fly for both tracks* — rejected for Track A on the tail argument above. (ii) *Precompute full convolved patterns* — rejected: it bakes in wavelength/Caglioti and destroys the on-the-fly augmentation envelope (the peak list is the maximal wavelength-independent precomputation). (iii) *257k individual peak files* — rejected for the training DataLoader in favour of a fork-safe blob store keyed by `cif_id`, the same random-access-across-processes argument the crystals DB made against per-row files (`DATA_ROADMAP.md` §1); individual files remain fine for exploration.
 
 **Conditions to revisit.** If the structure-factor engine is optimized enough that even the p99.9 tail fits the per-worker budget, Track A on-the-fly becomes reconsiderable — but the cache is cheap (~2–3 GB, ~1–2 h one-time) and removes the tail risk entirely, so precompute stands as the default.
+
+---
+
+## 10. Sim-vs-experimental validation: what a *forward* simulator can be held to
+
+**Decision.** Validation criterion #6 (`SIMXRD_ROADMAP.md` §7) is **noise-aware**, not a flat Rwp threshold. The forward-simulated pattern is compared to the **raw** experimental counts, **in 2θ**, with a jointly-fitted Chebyshev **background + scale** (`compare_structure_to_raw`); the gate is **goodness-of-fit `GoF = Rwp / Rwp_noise_floor < 4`** for ≥ 5 matched crystals. The **Rietveld-partition `R_Bragg`** is *reported as a structural bug-detector*, not gated at refinement-grade (≤ 5%). This section records why each of those choices is forced by the physics of the metrics, because the naive alternative (bgsub, log-d, flat `Rwp < 15%`) is misleading and cost real debugging.
+
+**Why raw + fitted background, not background-subtracted.** A Rietveld `Rwp < 15%` is conventionally computed on the **raw** pattern **with** a background model — the background counts inflate the denominator `Σw·y²`, so a good fit reads small. Against a *background-subtracted* pattern the denominator collapses and `Rwp` explodes (we measured ~80–120% for visually-good fits). So the comparison fits a smooth background jointly with scale to the raw counts; the simulator itself stays background-free.
+
+**Why 2θ, not log-d (the Jacobian pitfall).** The production coordinate is log-d, but the *background* is physically smooth in **2θ** (instrument scatter, air, fluorescence). After the Jacobian-corrected 2θ→log-d resample, a flat 2θ background becomes `bg·J(log-d)` — **not** representable by a low-order log-d polynomial. Fitting the Chebyshev background in log-d therefore fights the Jacobian and injects a spurious ~6% self-`Rwp` floor (an *exact* model scored 6%, `R_Bragg` 10–22%). Doing the whole comparison in 2θ makes self-consistency exact (Rwp 0.000%, R_Bragg 0.000%). log-d remains the encoder/training coordinate; the *validation metric* is simply computed where the background is smooth.
+
+**Why `Rwp` alone is not the gate — the noise floor.** For a weighted-LS scale, `Rwp = √(1 − cos²_weighted)`, and the Poisson weight `1/y` amplifies the *weak-intensity* points a fixed-structure forward model can never reproduce (diffuse scatter, weak texture-sensitive reflections). `Rwp` is thus bounded below by `R_expected` — the value a **perfect** model shows under the pattern's own counting statistics. `Rwp_noise_floor` estimates it directly (Poisson-realize the fitted model, recompute `Rwp`); `GoF = Rwp/floor ≈ √χ²` is the noise-normalized fit quality. This is exactly why a pattern can show `Rwp` 23% yet be a good fit (`GoF` ≈ 2) — high counts vs. low counts change the floor by 10×.
+
+**Why `R_Bragg` is reported, not gated at ≤ 5%.** `R_Bragg` (integrated `|F|²` agreement, Rietveld-partitioned so it is insensitive to peak width / background / noise) is the clean **bug detector**: a real structure-factor or position error drives it far up, whereas low `R_Bragg` with high `Rwp` localizes the problem to background/noise. But `R_Bragg ≤ 5%` is a *post-refinement* number: it presumes refined atoms, thermals, occupancies, a full texture model, and absorption. A forward simulator of a **fixed** ICSD structure with single-axis March-Dollase floors at `R_Bragg ≈ 20–60%`, dominated by **preferred orientation/texture** (a lab powder can show cos 0.99 on strong peaks yet `R_Bragg` 60% because medium reflections are redistributed by texture) and uncalibrated instrument peak-shape. Gating `R_Bragg ≤ 5%` would be gating the *absence of a Rietveld refinement engine*, which is out of scope (`§8` keeps the generator/encoder forward-only; there is no structure-refinement path). Reaching ≤ 5% is listed as a **revisit condition**, not a Phase-4 gate.
+
+**Alternatives considered.** (i) *Flat `Rwp < 15%` on bgsub in log-d* — rejected: Jacobian artifact + noise-blindness make it both wrong and unreachable (0/8 vs 3/8 when corrected). (ii) *Gate on `R_Bragg ≤ 5%`* — rejected: unreachable by forward simulation (floor ~22%); it measures refinement we don't do. (iii) *Add a mini-Rietveld refinement (lattice/texture/absorption) to hit ≤ 5%* — deferred as a separate phase; turns the simulator into a refinement tool.
+
+**Conditions to revisit.** If a structure/texture/absorption refinement path is ever added (its own phase), `R_Bragg ≤ 5%` becomes a meaningful gate on the refined result; until then `GoF < 4` + reported `R_Bragg` is the honest bar for a forward simulator.
 
 ---
 

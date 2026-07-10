@@ -1,0 +1,68 @@
+# Standard X-ray wavelengths for powder diffraction
+# All values in Angstroms (Å)
+# Sources: International Tables for Crystallography, Vol. C (2004)
+#          Hölzer et al., Phys. Rev. A 56, 4554 (1997)
+
+# Each source has Kalpha1, Kalpha2, Kalpha_avg (intensity-weighted average),
+# and Kbeta1 where commonly used.
+# Intensity ratio Kalpha2/Kalpha1 ≈ 0.5 for all conventional sources.
+
+sources:
+  Cu:
+    Kalpha1: 1.5405980
+    Kalpha2: 1.5444260
+    Kalpha_avg: 1.5418740
+    Kbeta1: 1.3922340
+    Z: 29
+
+  Mo:
+    Kalpha1: 0.7093187
+    Kalpha2: 0.7135916
+    Kalpha_avg: 0.7107300
+    Kbeta1: 0.6323680
+    Z: 42
+
+  Co:
+    Kalpha1: 1.7889960
+    Kalpha2: 1.7928350
+    Kalpha_avg: 1.7902760
+    Kbeta1: 1.6208260
+    Z: 27
+
+  Fe:
+    Kalpha1: 1.9360180
+    Kalpha2: 1.9399730
+    Kalpha_avg: 1.9373530
+    Kbeta1: 1.7565920
+    Z: 26
+
+  Cr:
+    Kalpha1: 2.2896550
+    Kalpha2: 2.2935660
+    Kalpha_avg: 2.2909230
+    Kbeta1: 2.0848810
+    Z: 24
+
+  Ag:
+    Kalpha1: 0.5594075
+    Kalpha2: 0.5638130
+    Kalpha_avg: 0.5608760
+    Kbeta1: 0.4970700
+    Z: 47
+
+  W:
+    Kalpha1: 0.2090100
+    Kalpha2: 0.2134430
+    Kalpha_avg: 0.2104880
+    Kbeta1: 0.1844370
+    Z: 74
+
+# Intensity ratio Kalpha2 / Kalpha1 (approximately constant across all anodes)
+kalpha2_kalpha1_ratio: 0.5
+
+# Common synchrotron wavelengths (examples)
+synchrotron:
+  diamond_i11: 0.826570
+  esrf_id22: 0.354180
+  aps_11bm: 0.414600
+  spring8_bl02b2: 0.500000

@@ -761,6 +761,12 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "crystalai-data", editable = "crystalai-data" },
@@ -769,10 +775,13 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "plotly", specifier = ">=5.15" },
     { name = "pymatgen", specifier = ">=2024.1" },
+    { name = "pytest", marker = "extra == 'dev'" },
     { name = "pyyaml" },
+    { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.10" },
     { name = "tqdm" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "cuda-bindings"

@@ -130,9 +130,19 @@ def default_store() -> Path:
 
     ``.../src/crystalai_data/xrddata/database.py`` -> ``parents[3]`` is the
     ``crystalai-data`` package directory. Overridable by the ingesters / apps via
-    an explicit path or the ``EXP_DATA_FOLDER`` env key.
+    an explicit path or the ``CRYSTALAI_EXP_DATA_FOLDER`` env key.
     """
     return Path(__file__).resolve().parents[3] / "exp_data"
+
+
+def resolve_store(env: dict[str, str], root: Path) -> Path:
+    """Experimental-store root from ``CRYSTALAI_EXP_DATA_FOLDER`` (resolved relative to the
+    monorepo ``root`` when not absolute), or :func:`default_store` when the key is unset."""
+    val = env.get("CRYSTALAI_EXP_DATA_FOLDER")
+    if not val:
+        return default_store()
+    p = Path(val)
+    return p if p.is_absolute() else (root / p)
 
 
 def pattern_dir(store: Path, source: str, source_id: str) -> Path:

@@ -28,7 +28,7 @@ Phase A2's encoder is the artifact that gets transferred (frozen) into Phase B2.
 ### 2.1 Phase A1 — Single-input baseline
 
 **Inputs.**
-- Log-d binned full diffraction pattern. Fixed window (default 0.7 Å to 8 Å, ~4000 bins). Background-removed before binning (a simple Chebyshev-fit subtraction or scipy `find_peaks` baseline is sufficient at this stage; refinement deferred).
+- Log-d binned full diffraction pattern. Fixed window **[0.7, 18] Å, 12,000 bins** (`DESIGN_DECISIONS.md` §1b). Background-removed before binning (a simple Chebyshev-fit subtraction or scipy `find_peaks` baseline is sufficient at this stage; refinement deferred).
 - Wavelength scalar (in Å), injected via FiLM for CNN, prepended token for Transformer ablation, initial hidden state for GRU ablation.
 - Validity mask (per-bin 0/1), passed as a second input channel (CNN), an attention mask (Transformer), or concatenated per-timestep feature (GRU). Marks the bins corresponding to the actual measured 2θ range (after conversion to log-d) vs. padding.
 
@@ -53,7 +53,7 @@ Both ablations run at a reduced configuration as a sanity check; if either match
 - Sub-head input: `[encoder_representation; f_CS]`. At training time, the ground-truth CS selects which sub-head receives gradient (teacher forcing). At inference, the predicted CS selects which sub-head's output to use. A soft-gating variant — weighting each sub-head's output by `p_CS` and summing — is available for ablation, providing gradient flow through multiple sub-heads when CS is uncertain.
 
 **Training data.**
-- Simulated patterns from `CrystalAI-simXRD` (the `PRODUCTION` augmentation preset: wavelength randomization, Caglioti randomization, mild asymmetry, matched d-range, plus the standard zero shift / intensity noise / background perturbation / impurity peaks).
+- Simulated patterns from `CrystalAI-simXRD` (the `PRODUCTION` augmentation preset: wavelength randomization, Caglioti randomization, crystallite-size / microstrain / Debye-Waller / preferred-orientation randomization, geometry-based axial-divergence asymmetry, slit response, **global zero-shift**, matched d-range, Poisson + relative-Gaussian noise `(λmax, σrel)`, residual background, and additive impurity/spurious peaks). Profiles are built in 2θ then resampled to log-d (`SIMXRD_ROADMAP.md` §1). Note: augmentation **never perturbs a peak's relative position or drops peaks** (`DESIGN_DECISIONS.md` §7) — no per-peak jitter, no dropping; the global zero-shift is a whole-pattern instrument offset on the full-profile view only.
 - ~5k labeled experimental patterns: RRUFF + opXRD-labeled + internal lab. Source tracked as metadata.
 - Batch composition: 70% sim, 30% experimental (range to explore: 60:40 to 80:20).
 
@@ -119,7 +119,7 @@ Each MLP: 2 linear layers, GELU activation, batch normalization between layers.
 - Same log-d binned full pattern, wavelength, validity mask as A1, feeding the full-profile encoder.
 - Peak-position histogram, no wavelength (peak positions are wavelength-independent in d-space), no mask (peaks-only-view is sparse and doesn't have the padding issue), feeding the peak-position encoder.
 
-The peak-position augmentations from `CrystalAI-simXRD` (importance-aware drops + manufactured-absence guard + angle-aware jitter) are applied to the peak histogram input.
+The peak-list augmentation from `CrystalAI-simXRD` **models the hand-picked input** (`DESIGN_DECISIONS.md` §7): small selection jitter + off-center bias, selective dropping of low-d (high-2θ) peaks when peak-dense (guarded so the retained high-d peaks still fix the SG), and additive spurious peaks. This matches the peak encoder's real inference input — a user-picked list with human error — rather than an idealized-clean one.
 
 **Losses.**
 

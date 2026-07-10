@@ -30,4 +30,4 @@ Every phase has an explicit validation gate (see the per-package roadmaps). Do n
 
 ## Migration
 
-Parts of the code exist in older repos. Migrated code must be adapted to the constraints above (old code likely uses `ase` / `Pysimxrd`, 2θ-native simulation, supercell disorder expansion, spglib symmetry re-derivation, or a frozen pretrained generator + conditioning adapter — all now disallowed) and re-validated against the gates. Never trust a ported file because it worked before.
+Parts of the code exist in older repos. Migrated code must be adapted to the constraints above (old code likely uses `ase` / `Pysimxrd`, 2θ-native *output/binning*, supercell disorder expansion, spglib symmetry re-derivation, or a frozen pretrained generator + conditioning adapter — all now disallowed) and re-validated against the gates. Note: the simulator *does* build per-peak profiles in 2θ and resample to **log-d** (the disallowed pattern is 2θ *output/binning*, not 2θ intermediate construction; log-d remains the production/training coordinate — see `crystalai-simxrd/SIMXRD_ROADMAP.md` §1). Never trust a ported file because it worked before.

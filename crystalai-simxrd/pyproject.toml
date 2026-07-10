@@ -15,6 +15,9 @@ dependencies = [
     "crystalai-data",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

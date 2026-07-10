@@ -8,74 +8,17 @@
 
 ## 1. Design at a glance
 
-### Output domains
+Full rationale for the design choices below lives in `../DESIGN_DECISIONS.md`; this section states only the load-bearing points.
 
-The simulator can produce patterns in either **2θ-intensity** or **log(d)-intensity** space.
+**Output domains.** Patterns can be produced in **2θ** (validation / sanity-checks vs pymatgen and experimental data) or **log(d)** (the production/training format — uniform log(d) bins over a fixed d-window). Linear-d is a derived format, not a target. Rationale: `DESIGN_DECISIONS.md` §1.
 
-- **2θ-I** is the natural format for angle-dispersive lab XRD and used for sanity-checking against pymatgen and against experimental data.
-- **log(d)-I is the production format for training.** All training patterns are binned uniformly in log(d) over a fixed d-window. Rationale: `DESIGN_DECISIONS.md` §1.
+**Simulation domain — build in 2θ, convert to log-d once (CW).** log(d) is the encoder coordinate, not where the physics is computed. For constant-wavelength sources (all that are in scope), the pattern is **assembled in 2θ** — where the instrument physics is defined — and converted to log-d **once at the end**; only normalization and the relative-noise augmentation follow in log-d. Native-log-d single-kernel convolution is kept only as a fast approximate preview preset; TOF/neutron get their own strategies later. Rationale: `DESIGN_DECISIONS.md` §1a.
 
-D-spacing without the logarithm is supported as a derived format but is not the production target.
+**Per-peak profile shape.** Core is the **Thompson-Cox-Hastings pseudo-Voigt** (Gaussian FWHM from the Caglioti relation `U·tan²θ + V·tanθ + W`; Lorentzian FWHM from crystallite size / strain), convolved with the instrument kernels (axial divergence, slit) in 2θ.
 
-### Production simulation path: native log-d convolution
+**Precompute vs on-the-fly.** Per-structure Bragg cost scales as `O(N_reflections × n_sites)` and the ICSD size distribution is heavy-tailed (p99 606 sites, seconds each), so pure on-the-fly Bragg cannot feed the DataLoader. The fix exploits that the **d-space peak list `{d, |F|²}` is wavelength-independent** (everything structure-dependent depends on `sinθ/λ = 1/2d`): **precompute it once per structure** (fork-safe `bragg_peaks` blob store keyed by `cif_id`, ~2–3 GB); **everything else runs on-the-fly** from that list (wavelength, geometry, profile build, effects, noise, augmentation) at flat, tail-free cost. This preserves full wavelength/augmentation diversity. Full rationale, the ICSD long-tail figure, Track-A-vs-B, storage, and the lossless-split validation gate: `DESIGN_DECISIONS.md` §9. Code: `simulation/batch.py` + `scripts/precompute_bragg.py` (Phase 5.1); `Simulator` accepts either a `Structure` (compute Bragg) or a cached peak list (skip to the live stage).
 
-The simulator's production path computes Bragg peaks in d-space directly, then convolves each peak with a resolution function defined in log-d. The resolution function in log-d is approximately constant FWHM across the pattern (this is the property that makes log-d attractive — see `DESIGN_DECISIONS.md` §1), with the profile shape transformed from the 2θ-domain pseudo-Voigt to a slightly asymmetric form via the Jacobian.
-
-Two non-production strategies are retained for validation:
-
-- **Strategy A (simulate-in-2θ-then-convert-to-log-d).** Used only as a validation tool — comparing the production native-log-d output against a 2θ-convolved-then-converted reference quantifies the profile-shape approximation error.
-- **Strategy C (TOF-native, in d-space with Ikeda-Carpenter back-to-back exponential × Gaussian).** Out of scope for this submission; reserved for future neutron diffraction extensions.
-
-### Per-peak profile shapes
-
-Profiles are computed per-peak with position-dependent FWHM via the Caglioti relation in 2θ-space, mapped to log-d via the Jacobian for the production path. This is physically correct — peak widths broaden at higher 2θ due to instrumental and sample effects — and avoids the unrealistic uniform-kernel simplification common in ML training datasets.
-
-### Augmentation pipeline
-
-Augmentations are composable per-call transforms in the style of torchvision's `transforms.Compose`. Each is domain-aware: it reads the `DomainGrid` tag from the pattern and applies physically appropriate perturbations in the active coordinate. Augmentations are applied on-the-fly during training, not pre-computed into static datasets.
-
-### Precompute vs on-the-fly: the Bragg-peak boundary
-
-This is the load-bearing performance decision for training-time simulation. It fixes exactly which part of the pipeline is computed once and cached, and which runs live in the DataLoader. (Rationale, the measured ICSD size distribution, and the long-tail figure — plus why Track B differs — are in `../DESIGN_DECISIONS.md` §9.)
-
-**The problem.** Training simulates a pattern per `__getitem__` in DataLoader worker processes, and must keep 8 GPUs fed. But the ICSD workload is extremely heavy-tailed — `n_sites` median 30, p90 124, **p99 606, max 23,704** (over 211,879 ICSD structures) — and the Bragg structure-factor cost scales as **O(N_reflections × n_sites)**. Benchmarking the from-scratch engine (`crystalai-difsim`'s `compute_bragg_reflections`) over the production d-window [0.7, 8] Å:
-
-| n_sites (bin median) | Bragg time (median) | p90 |
-|---|---|---|
-| 8   | 4.5 ms | 12 ms |
-| 26  | 17 ms  | 44 ms |
-| 56  | 59 ms  | 174 ms |
-| 90  | 156 ms | 281 ms |
-| 254 | 1.2 s  | 1.6 s |
-| 496 | 4.4 s  | 7.8 s |
-
-The median structure is ~16 ms; the tail is **seconds**, and the largest cells OOM / take minutes. A DataLoader feeding 8 GPUs needs O(10³) patterns/s — a budget of tens of ms per worker per pattern. The median is already marginal; **the tail is fatal**: random batch sampling hits large-cell structures every batch, and one multi-second structure stalls a worker for the equivalent of ~100 patterns. Vectorizing the per-site scattering loop (group identical elements — a straightforward 5–10× win) fixes the *median* but not the tail. **Pure on-the-fly Bragg for ICSD is therefore not viable.**
-
-**The physical key — the d-space peak list is wavelength-independent.** Bragg ties θ and λ through d: `sinθ/λ = 1/(2d)`. Every *structure-dependent* quantity depends on `sinθ/λ` (= `1/2d`), never on λ and θ separately:
-
-- peak position: `d` (lattice only);
-- atomic scattering factor: `f(sinθ/λ) = f(1/2d)`;
-- Debye-Waller: `exp(-B·(sinθ/λ)²) = exp(-B/4d²)`;
-- and hence `|F(hkl)|²`.
-
-The *only* wavelength-dependent steps are the θ-mapping (`θ = arcsin(λ/2d)`), the Lorentz-polarization factor `LP(θ)`, the Caglioti FWHM (defined in 2θ), and which d-window is accessible. **So precomputing the d-space peak list costs nothing in wavelength diversity — the load-bearing wavelength randomization stays entirely on-the-fly.**
-
-**The line.** Precompute *exactly* the wavelength-independent quantity — the merged d-space reflection list `{dᵢ, |Fᵢ|²}` down to `d_min = 0.7 Å` (the widest production window) — once per structure. Everything downstream stays live:
-
-- **Precompute (once/structure, offline batch):** `Structure → {d, |F|²}` with occupancy-weighted structure factors (no DW, no LP, no wavelength). One record per `cif_id`. This is the expensive, heavy-tailed, structure-dependent step — paid once.
-- **On-the-fly (DataLoader, from the cached peak list):** sample λ / Caglioti U,V,W / crystallite size / strain / background; crop to the matched d-window; apply the overall-B Debye-Waller envelope (keeps thermal randomization); map `d→θ(λ)` and apply `LP`; Caglioti FWHM → log-d via the Jacobian; convolve peaks onto the fixed log-d grid; background + noise; profile/peak augmentations. All **O(N_peaks)** with N_peaks bounded (a few hundred–few thousand, truncated to strong peaks) → **cost is flat across structures, no heavy tail**, sub-ms to a few ms.
-
-This is the *maximal* wavelength-independent precomputation and the *minimal* live cost, with the full augmentation envelope (wavelength / Caglioti / matched-d-range — the load-bearing three) preserved. It is not a compromise on augmentation; it is the exact factoring the physics allows.
-
-**Storage.** The peak list has the *same* access pattern as the structure blob — point lookup by id across worker processes — so it takes the *same* answer DATA_ROADMAP §1 reached for structures: a fork-safe, memory-mappable blob store, **not 257k individual files** (which pay inode/open-latency and defeat DataLoader random access on NFS — the exact argument the crystals DB made against per-row files). Store gzipped `{d[], F2[]}` (optionally a dominant `hkl` per peak, see below) keyed by `cif_id`, as a `bragg_peaks` table in a sibling SQLite or a concatenated memmap + offset index. Size: ≤ ~3000 peaks × 2 × float32 ≈ 24 KB/structure → **~2–3 GB gzipped over 257k structures**. (Per-structure `.npy`/`.npz` files are the simplest to write and fine for exploration/debugging, but should not back the training DataLoader.)
-
-**Precompute cost.** One-time batch over 257k structures; tail-weighted mean ~0.2 s/structure, embarrassingly parallel → **~1–2 h on a multicore node** (less after the structure-factor vectorization). Trivially re-runnable, versioned by `d_min` + engine hash.
-
-**One wrinkle — preferred orientation.** March-Dollase PO needs `hkl` + a texture axis, which the d-merge discards. PO is *not* in the load-bearing set. Options: store a dominant `hkl` per merged peak (+3 small ints) to keep an approximate on-the-fly PO, or drop PO from the PRODUCTION preset. Recommendation: store the dominant `hkl` — cheap, keeps PO available without re-enumerating reflections.
-
-**Validation gate for the boundary.** A pattern built on-the-fly from the cached peak list must match a full from-scratch simulation (identical conditions, no cache) to the Phase-1 tolerances — peak positions ≤ 0.001 Å in d, integrated intensities ≤ 1% — across the test CIFs. This proves the split is lossless. (Added to §7 as criterion 9.)
-
-**Where it lives.** The precompute is `simulation/batch.py` + `scripts/precompute_bragg.py` (Phase 5.1): it reads structures via `crystalai_data.CrystalDatabase` and writes the `bragg_peaks` store. The live path is the `Simulator`/augmentor stack consumed by `crystalai-methods` — refactored so `Simulator` can take either a `Structure` (compute Bragg now) *or* a cached peak list (skip straight to the on-the-fly stage). The one code path serves both validation (structure in) and training (peak list in).
+**Augmentation pipeline.** Composable per-call transforms (torchvision-`Compose` style), domain-aware, applied on-the-fly during training — never pre-computed into static datasets. See §5.
 
 ---
 
@@ -98,22 +41,24 @@ crystalai-simXRD/
 │       │   └── domain.py                 # Domain enum (TWO_THETA, D_SPACING, LOG_D), Jacobians, DomainGrid
 │       │
 │       ├── profiles/
-│       │   ├── peak_shapes.py            # Gaussian, Lorentzian, pseudo-Voigt, split-PV (2θ domain)
-│       │   ├── caglioti.py               # Caglioti U,V,W → FWHM(2θ); mixing parameter η(2θ)
-│       │   ├── asymmetry.py              # Axial divergence asymmetry (Finger-Cox-Jephcoat)
-│       │   └── convolver.py              # Domain-aware profile convolution engine
+│       │   ├── peak_shapes.py            # Gaussian, Lorentzian, Voigt, Thompson-Cox-Hastings PV (production core), split-PV (2θ domain)
+│       │   ├── caglioti.py               # Caglioti U,V,W → Gaussian FWHM(2θ); TCH mixing η(2θ)
+│       │   ├── axial_divergence.py       # Axial-divergence asymmetry, parameterized by instrument geometry (Van Laar-Yelon; FCJ alt.)
+│       │   ├── slit.py                   # Rectangular slit (top-hat) instrumental-resolution response
+│       │   └── convolver.py              # Per-peak 2θ composite (TCH-PV ⊗ axial-div ⊗ slit) → resample to log-d grid
 │       │
 │       ├── effects/
-│       │   ├── broadening.py             # Scherrer size broadening, Williamson-Hall strain
+│       │   ├── broadening.py             # Scherrer size broadening (Lorentzian), Williamson-Hall strain (Gaussian)
 │       │   ├── thermal.py                # Debye-Waller factor
 │       │   ├── preferred_orientation.py  # March-Dollase model
 │       │   ├── absorption.py             # Brindley absorption
 │       │   ├── lorentz_polarization.py   # LP factor
-│       │   └── background.py             # Chebyshev polynomial + noise models
+│       │   ├── zero_shift.py             # Global 2θ zero-shift (sample-displacement instrument miscalibration)
+│       │   └── background.py             # residual background (bgsub domain) + optional physical Chebyshev
 │       │
 │       ├── augmentations/
 │       │   ├── profile_augmentations.py  # Full-pattern augmentations
-│       │   ├── peak_augmentations.py     # Peak-list augmentations (importance-aware)
+│       │   ├── peak_augmentations.py     # Peak-list augmentation: human-picking model (selection jitter + off-center, guarded low-d dropping, spurious peaks)
 │       │   └── presets.py                # Named augmentation presets
 │       │
 │       ├── simulation/
@@ -126,8 +71,9 @@ crystalai-simXRD/
 │       │   └── experimental.py           # Loaders for experimental patterns (delegates to crystalai-data)
 │       │
 │       ├── comparison/
-│       │   ├── metrics.py                # Rwp, Rp, cosine similarity, peak-position RMSD
+│       │   ├── metrics.py                # Rwp (+noise-floor, GoF), Rietveld-partition R_Bragg, Rp, cosine, peak-position RMSD
 │       │   ├── alignment.py              # 2θ alignment / zero-shift correction
+│       │   ├── compare.py                # sim-vs-experimental: to-raw (2θ, fitted bg — criterion #6) + to-bgsub (log-d)
 │       │   └── overlay.py                # Plotly overlay plotting utilities
 │       │
 │       └── utils/
@@ -160,7 +106,7 @@ crystalai-simXRD/
 └── scripts/
     ├── precompute_bragg.py               # CLI: build the {d,|F|²} bragg_peaks cache from crystals.sqlite (§1, Phase 5.1)
     ├── simulate_batch.py                 # CLI: batch simulate from a directory of CIFs
-    ├── compare_with_experiment.py        # CLI: overlay sim vs experimental
+    ├── validate_criterion6.py            # CLI: noise-aware sim-vs-experimental gate (GoF<4 over exp_subset)
     └── launch_dashboard.py
 ```
 
@@ -199,12 +145,16 @@ No `ase`. No `Pysimxrd`. No `mp-api`.
 
 ### Phase 0: Scaffolding
 
+*Motivation: get the skeleton, reference data, and validation fixtures in place so the core can be built and checked against pymatgen from step one.*
+
 - Package skeleton, `pyproject.toml`, all subpackage `__init__.py` files.
 - Reference data: Cromer-Mann scattering factors (JSON), standard wavelengths (YAML).
 - Test infrastructure: `pytest` config, example CIF fixtures (NaCl, Si, CeO₂, LaB6, α-quartz, rutile + one disordered structure).
 - `wavelengths.py`: dictionary of standard X-ray wavelengths (Cu Kα1/2/avg, Mo Kα1, Co Kα1, Cr Kα1, Ag Kα1, plus a synchrotron wavelength range generator).
 
 ### Phase 1: Core simulation engine (2θ + log-d)
+
+*Motivation: the load-bearing path — Structure/peak-list → Bragg → per-peak 2θ profile → log-d — that every effect and augmentation builds on. Correctness here is validated against pymatgen before anything is stacked on top.*
 
 | Step | Task |
 |------|------|
@@ -213,54 +163,64 @@ No `ase`. No `Pysimxrd`. No `mp-api`.
 | 1.3 | `scattering.py` — Cromer-Mann 9-parameter atomic scattering factors `f(sinθ/λ)` |
 | 1.4 | `bragg.py` — given a `Structure` + wavelength + d-window: compute all allowed Bragg reflections with `(hkl, 2θ, d, multiplicity, |F(hkl)|², integrated intensity)`. **Disorder handling**: occupancy-weighted structure factors for sites with fractional occupancies — never supercell-order disordered structures before computing Bragg peaks. Validate against pymatgen's `XRDCalculator`. |
 | 1.5 | `lorentz_polarization.py` — LP factor `(1 + cos²(2θ)) / (sin²(θ)·cos(θ))` for Bragg-Brentano geometry; baked into integrated intensity in 2θ-domain before any conversion |
-| 1.6 | `peak_shapes.py` — Gaussian, Lorentzian, pseudo-Voigt, Thompson-Cox-Hastings PV. Operate on a generic x-axis. |
-| 1.7 | `caglioti.py` — Caglioti relation: `FWHM_G² = U·tan²(θ) + V·tan(θ) + W`; mixing parameter η(2θ) from Thompson-Cox-Hastings; defaults for STADI-P, generic Bragg-Brentano |
-| 1.8 | `binning.py` — domain-aware grid construction. `log_d_grid(d_min, d_max, n_bins)` is the production grid; `two_theta_grid` for validation. |
-| 1.9 | `convolver.py` — domain-aware convolution. **Production path**: native log-d convolution. For each Bragg peak, compute FWHM in 2θ via Caglioti, map to log-d via the Jacobian `FWHM_logd = FWHM_2θ · |d(logd)/d(2θ)|`, generate the profile (slightly asymmetric pseudo-Voigt approximation in log-d), sum onto the log-d grid. **Validation path**: simulate-in-2θ then convert. |
-| 1.10 | `simulator.py` (v1) — orchestrator: `CIF → Structure → Bragg peaks → convolved profile`. Accepts `domain=Domain.LOG_D` (production default) or other domains. Minimal version with LP factor and convolution only. |
+| 1.6 | `peak_shapes.py` — Gaussian, Lorentzian, Voigt (`scipy.special.wofz`), **Thompson-Cox-Hastings pseudo-Voigt (production core)**, split-PV. Operate on a generic x-axis (built in 2θ). |
+| 1.7 | `caglioti.py` — Caglioti relation: `FWHM_G² = U·tan²(θ) + V·tan(θ) + W`; TCH mixing η(2θ); defaults for STADI-P, generic Bragg-Brentano |
+| 1.8 | `binning.py` — domain-aware grid construction. `log_d_grid(d_min, d_max, n_bins)` is the production grid; `two_theta_grid` for the local per-peak construction grid and 2θ validation. |
+| 1.9 | `convolver.py` — **production path: per-peak 2θ construction → resample to log-d.** For each Bragg peak: map `d→2θ(λ)`, compute Caglioti FWHM(2θ), build the TCH-PV core on a local 2θ grid, convolve the instrument kernels (axial divergence, slit — Phase 2), then resample the local profile onto the global log-d grid with the Jacobian intensity correction and accumulate. **Fast preset**: single symmetric pseudo-Voigt convolved directly in log-d (skips instrument kernels; previews/ablations only). |
+| 1.10 | `simulator.py` (v1) — orchestrator: `Structure | cached peak list → Bragg peaks → per-peak 2θ profile → log-d resample`. Accepts `domain=Domain.LOG_D` (production default) or other domains. Minimal version with LP + TCH-PV convolution only (instrument kernels arrive in Phase 2). |
 
-**Checkpoint.** Simulator produces basic patterns in 2θ and log-d. Peak positions match pymatgen to within 0.001° (2θ) or 0.001 Å (d). Round-trip: simulate in 2θ, convert to log-d, fresh simulate in log-d — integrated intensities agree within 1%.
+**Checkpoint.** Simulator produces basic patterns in 2θ and log-d. Peak positions match pymatgen to within 0.001° (2θ) or 0.001 Å (d). Round-trip: 2θ construction → log-d resample → back to 2θ preserves integrated intensities within 1%.
 
 ### Phase 2: Physical effects
+
+*Motivation: make simulated patterns resemble real CW measurements — realistic peak shapes, instrument geometry, sample effects, and the bgsub-domain background — so the encoder trains on physically plausible variation. All applied in 2θ before the log-d conversion (`DESIGN_DECISIONS.md` §1a).*
 
 | Step | Task |
 |------|------|
 | 2.1 | `thermal.py` — Debye-Waller factor `exp(-B·sin²(θ)/λ²)` applied to structure factors |
 | 2.2 | `broadening.py` — size (Scherrer Lorentzian `β_L = Kλ/(D cosθ)`), strain (Gaussian `β_G = 4ε·tanθ`); fold into Caglioti parameters or add in quadrature |
 | 2.3 | `preferred_orientation.py` — March-Dollase model |
-| 2.4 | `asymmetry.py` — Finger-Cox-Jephcoat axial divergence (affects low-2θ peaks) |
-| 2.5 | `absorption.py` — Brindley microabsorption; flat-plate absorption |
-| 2.6 | `background.py` — background models for two uses. (a) Full physical background (Chebyshev order 5–10; Compton + air scatter + dark current) — used only when emulating raw data or for the arPLS-emulation residual mode. (b) **Residual background** (the training default): a low-order, low-amplitude smooth baseline that may go slightly negative, since we operate in the background-subtracted domain (§5 #10). The counting-noise floor (§5 #7) depends on the *pre-subtraction* level, so background level and noise are sampled jointly. |
-| 2.7 | `domain_convert.py` — full-profile domain conversion between 2θ and log-d (resampling + Jacobian correction). Validation tool only — production simulates natively in the target domain. |
-| 2.8 | `simulator.py` (v2) — integrate all effects with toggleable flags; YAML / dataclass configuration |
+| 2.4 | `axial_divergence.py` — axial-divergence asymmetry (affects low-2θ peaks), parameterized by **instrument geometry**: detector distance `L`, slit half-height `H`, sample half-height `S` (Van Laar & Yelon 1984; Finger-Cox-Jephcoat as an equivalent alt.). Convolved into the per-peak 2θ profile (§1.9). Randomizing over realistic `(L,H,S)` is the geometry-augmentation. |
+| 2.5 | `slit.py` — rectangular slit (top-hat) instrumental-resolution kernel, convolved into the per-peak 2θ profile. Optional: Caglioti already carries instrumental Gaussian broadening, so enable the explicit slit only when not double-counting (reduce Caglioti `W` accordingly). |
+| 2.6 | `zero_shift.py` — global 2θ zero-shift (sample-displacement miscalibration): one offset `δ(2θ)` applied to **all** peak centres before the log-d resample. A genuine instrument effect (distinct from the removed per-peak position perturbation, `DESIGN_DECISIONS.md` §7); in log-d it becomes a smooth angle-dependent distortion. |
+| 2.7 | `absorption.py` — Brindley microabsorption; flat-plate absorption |
+| 2.8 | `background.py` — background models, **applied in 2θ before the log-d conversion** (`DESIGN_DECISIONS.md` §1a). (a) Full physical background (Chebyshev order 5–10; Compton + air scatter + dark current) — used only when emulating raw data or for the arPLS-emulation residual mode. (b) **Residual background** (the training default): a low-order, low-amplitude smooth baseline that may go slightly negative, since we operate in the background-subtracted domain. The counting-noise floor depends on the *pre-subtraction* level, so background level and noise are sampled jointly (§5 order). |
+| 2.9 | `domain_convert.py` — full-profile domain conversion between 2θ and log-d (resampling + Jacobian correction). Validation / fast-preset tool; the production path resamples per-peak (§1.9). |
+| 2.10 | `simulator.py` (v2) — integrate all effects with toggleable flags; YAML / dataclass configuration |
 
-**Checkpoint.** Patterns include realistic peak shapes, thermal effects, size/strain broadening, preferred orientation, asymmetry, backgrounds — natively in log-d. Domain conversion of a convolved pattern preserves integrated intensities within 2%. Visual comparison against a handful of experimental patterns shows qualitatively similar profile shapes.
+**Checkpoint.** Patterns include realistic peak shapes, thermal effects, size/strain broadening, preferred orientation, geometry-based axial-divergence asymmetry, slit response, zero-shift, and residual backgrounds — delivered in log-d via the per-peak 2θ→log-d resample. Round-trip 2θ↔log-d preserves integrated intensities within 2%. Visual comparison against a handful of experimental patterns shows qualitatively similar profile shapes.
 
 ### Phase 3: Augmentation pipeline
+
+*Motivation: turn the effect set into on-the-fly, config-bounded training-time variation that spans the experimental envelope (§5), so the encoder generalizes from simulated to real patterns.*
 
 | Step | Task |
 |------|------|
 | 3.1 | `profile_augmentations.py` — domain-aware composable transforms. See §5 below. |
-| 3.2 | `peak_augmentations.py` — importance-aware peak-list augmentation. See §6 below. |
+| 3.2 | `peak_augmentations.py` — human-picking model for the manually-supplied peak list: selection jitter + off-center bias, guarded low-d (high-2θ) dropping, spurious peaks. See §6 below. |
 | 3.3 | `presets.py` — named presets: `DIFCON_STYLE` (matching the prior paper's setup), `PRODUCTION` (wavelength + Caglioti + mild asymmetry + matched d-range), `AGGRESSIVE`, `MILD` |
 
 **Checkpoint.** Augmentation pipeline produces visually realistic variations spanning the experimental variability envelope. Each preset is callable, composable, and respects the pattern's domain tag.
 
 ### Phase 4: Interactive dashboard
 
+*Motivation: visual validation and consortium demos — see each effect and augmentation act on a live pattern, and overlay sim vs experimental.*
+
 `app/dashboard.py` — Gradio app with tabs:
 
-- **Single Pattern Simulator.** Upload CIF or pick from examples. Sliders for: domain toggle (2θ / log-d), wavelength (greyed in log-d), 2θ / d range, step size, crystallite size, microstrain, temperature, preferred orientation, Caglioti U/V/W, background type + level, zero shift. Live plot updates.
-- **Effect Decomposition.** Same pattern with effects toggled on/off: stick → + LP → + thermal → + size → + strain → + background → + noise.
+- **Single Pattern Simulator.** Upload CIF or pick from examples. Sliders for: domain toggle (2θ / log-d), wavelength (greyed in log-d), 2θ / d range, step size, crystallite size, microstrain, temperature, preferred orientation, Caglioti U/V/W, axial-divergence geometry (L/H/S), zero-shift, background type + level. Live plot updates.
+- **Effect Decomposition.** Same pattern with effects toggled on/off: stick → + LP → + thermal → + size → + strain → + axial-divergence → + zero-shift → + background → + noise.
 - **Augmentation Preview.** Select a preset, apply N random augmentations to the same base pattern, overlay all.
 - **Sim vs Experimental.** Upload or select an experimental pattern + corresponding CIF. Overlay simulated vs experimental, Rwp, difference curve. Adjust sim parameters to minimize residual.
 
 ### Phase 5: Batch simulation & PyTorch integration
 
+*Motivation: produce the cached `bragg_peaks` artifact (§1 / `DESIGN_DECISIONS.md` §9) and the `Simulator` + augmentor API that `crystalai-methods` drives in its DataLoader.*
+
 | Step | Task |
 |------|------|
-| 5.1 | `batch.py` + `scripts/precompute_bragg.py` — the **Bragg-peak precompute** (see §1 "Precompute vs on-the-fly"). Given a `Structure` iterator from `crystalai_data.CrystalDatabase`, compute the wavelength-independent d-space reflection list `{d, |F|²}` (occupancy-weighted, no DW/LP/λ) down to `d_min=0.7 Å`, truncated to strong peaks (+ optional dominant `hkl` for PO), and write the fork-safe `bragg_peaks` blob store keyed by `cif_id`. Multiprocessing; ~1–2 h over 257k structures. This — not full patterns — is the cached training artifact; convolution/effects/augmentation run live in the DataLoader. |
-| 5.2 | Public API for `CrystalAI-methods`: `from crystalai_simxrd import Simulator, ProfileAugmentor, PeakAugmentor, Domain`. `Simulator` returns a `SimulatedPattern` dataclass with `(x_axis, intensity, peak_positions_d, peak_intensities, domain, wavelength, noise_floor, metadata)`, where **`noise_floor = (λmax, σrel)`** — the counting/baseline-noise conditioning params actually applied (§5 #7–8). The encoder is conditioned on `wavelength` *and* `noise_floor` (`DESIGN_DECISIONS.md` §4, §4a); the experimental loader computes the same `(λmax, σrel)` from a pattern's background regions so sim and real share the feature. Augmentors are `torch.nn.Module`-compatible transforms that respect the pattern's domain tag. |
+| 5.1 | `batch.py` + `scripts/precompute_bragg.py` — the **Bragg-peak precompute** (§1; rationale `DESIGN_DECISIONS.md` §9). Given a `Structure` iterator from `crystalai_data.CrystalDatabase`, compute the wavelength-independent d-space reflection list `{d, |F|²}` (occupancy-weighted, no DW/LP/λ) down to `d_min=0.7 Å`, truncated to strong peaks (+ optional dominant `hkl` for PO), and write the fork-safe `bragg_peaks` blob store keyed by `cif_id`. Multiprocessing; ~1–2 h over 257k structures. This — not full patterns — is the cached training artifact; convolution/effects/augmentation run live in the DataLoader. |
+| 5.2 | Public API for `CrystalAI-methods`: `from crystalai_simxrd import Simulator, ProfileAugmentor, PeakAugmentor, Domain`. `Simulator` returns a `SimulatedPattern` dataclass with `(x_axis, intensity, peak_positions_d, peak_intensities, domain, wavelength, noise_floor, metadata)`, where **`noise_floor = (λmax, σrel)`** — the counting/baseline-noise conditioning params actually applied (§5). The encoder is conditioned on `wavelength` *and* `noise_floor` (`DESIGN_DECISIONS.md` §4, §4a); the experimental loader computes the same `(λmax, σrel)` from a pattern's background regions so sim and real share the feature. Augmentors are `torch.nn.Module`-compatible transforms that respect the pattern's domain tag. |
 | 5.3 | `normalization.py` — pattern normalization (max, area, sqrt for Poisson-like data) |
 | 5.4 | `peak_detection.py` — simple `scipy.find_peaks` wrapper for validation. Not used in production. |
 
@@ -270,68 +230,55 @@ No `ase`. No `Pysimxrd`. No `mp-api`.
 
 ## 5. Profile augmentations
 
-All augmentations are domain-aware: they read the `DomainGrid` tag and apply physically appropriate perturbations in the active coordinate. The `PRODUCTION` preset combines all of these.
+Composable, domain-aware transforms applied on-the-fly (never pre-computed into static datasets). **Parameterization:** each augmentation is `f(pattern; θ)` with `θ ~ U[lo, hi]` from the config, kept smooth in `θ` where natural (differentiable-augmentation-ready); a noise term's *level* is such a `θ` while its per-sample draw is stochastic. This section covers the **full-profile** view: its peak positions are the physical measurement — never per-peak perturbed — and the only position effect is the *global* zero-shift (whole-pattern instrument offset, preserving relative spacings). The manually-picked **peak-list** view is augmented separately for human error (§6). The `PRODUCTION` preset combines all of the below.
 
-**Parameterization principle.** Each augmentation is a function `out = f(pattern; θ)` of a parameter `θ` drawn `θ ~ U[lo, hi]`, with `[lo, hi]` owned by the pattern-augmentation config files. Where the effect is *naturally smooth* in `θ` (wavelength, Caglioti U/V/W, zero-shift, size/strain, March-Dollase `r`, FCJ asymmetry, residual-background amplitude, and the noise *levels* `λmax`/`σrel`), we keep it that way — uniform sampling then gives smooth, bounded coverage of the augmentation manifold, and the map stays differentiable in `θ` for any later differentiable-augmentation use. Two kinds of randomness are distinguished: the smooth **parameter** `θ`, versus the **stochastic realization** of the noise terms (the noise *level* is a smooth `θ`; the per-sample draw is random by nature).
+| Augmentation | Param θ | Range / default | Notes |
+|---|---|---|---|
+| **Required — wavelength-conditioning** ||||
+| Wavelength | λ | U[0.5, 1.8] Å | Cu/Mo/Co/Cr/Ag Kα + synchrotron; the FiLM conditioning input (`DESIGN_DECISIONS.md` §1/§4) |
+| Caglioti | U, V, W | realistic instrument spread | Gaussian FWHM(2θ) = `U·tan²θ + V·tanθ + W` |
+| Matched d-range | — | window **[0.7, 18] Å**, 12000 bins (DD §1b) | pick window first; per-λ 2θ range so all patterns share one log-d window |
+| **Physical effects** (Pysimxrd set; sample the effect's parameter) ||||
+| Crystallite size | D | realistic range | Scherrer Lorentzian |
+| Microstrain | ε | — | Williamson-Hall Gaussian |
+| Debye-Waller | B | — | `exp(−B/4d²)` envelope on `|F|²` |
+| Preferred orientation | r (+ axis) | ~1 | March-Dollase (needs a dominant `hkl`; §9/DD) |
+| Axial divergence | L, H, S | realistic geometries | Van Laar-Yelon; low-2θ asymmetry — main gain from Pysimxrd |
+| Slit (optional) | width | — | top-hat; enable only if not double-counting Caglioti |
+| Global zero-shift | δ(2θ) | U(−δ₀, δ₀) | whole-pattern offset (sample-displacement); *not* per-peak (§6) |
+| **Stochastic / additive** ||||
+| Poisson noise | λmax | U[1, 100] | counting noise, in 2θ; formula in `DESIGN_DECISIONS.md` §4a; primary noise |
+| Gaussian noise | σrel | U[1e-3, 1e-1] | relative, in log-d after normalization |
+| Residual background | amplitude | small, may go negative | bgsub-domain residual; optional arPLS-emulation (`PRODUCTION`) reuses `crystalai_data`'s operator |
+| Impurity/spurious peaks | count | 0–N | additive; never touches/removes a true peak |
+| Edge crop / pad | edge | — | hard crop for masked-window training (methods) |
 
-A few augmentations are **irreducibly discrete** and are implemented as such (differentiable relaxations are noted as future options, not the default — a deliberate choice to stay close to physical intent):
+`(λmax, σrel)` are emitted as conditioning metadata (§5.2) so the encoder is told its noise floor (`DESIGN_DECISIONS.md` §4a). **Explicitly dropped:** intensity-envelope perturbation (destroys real intensity information the generator needs, once wavelength is an explicit input).
 
-- **peak dropping** (§6) — Bernoulli on/off per peak (relaxation: continuous per-peak attenuation `a_i∈[0,1]`);
-- **impurity-peak count** — integer 0–N (relaxation: `K` fixed amplitude-slots each `∈[0,a_max]` with mass at 0);
-- **hard crop** for masked-window training — a step cut required by methods (relaxation: soft cosine taper);
-- the **manufactured-absence guard** (§6) — an accept/reject *validity constraint*, not a parameterized augmentation, and exempt from this framework by construction.
+### Order (single 2θ → log-d conversion)
 
-**Required augmentations** (load-bearing for the wavelength-conditioning strategy):
+**All CW-instrument physics is applied in 2θ; convert to log-d once; normalization and relative noise follow in log-d** (`DESIGN_DECISIONS.md` §1a). Count-domain effects precede normalization; relative effects follow it.
 
-1. **Wavelength randomization.** For each training CIF, sample a wavelength uniformly from ~[0.5, 1.8] Å covering Cu Kα, Mo Kα, Co Kα, Cr Kα, Ag Kα, and synchrotron values. Simulate the full 2θ pattern at that wavelength with physically correct LP, DW, absorption, then convert to log-d. Without this, the wavelength input to the encoder becomes meaningless — the model cannot learn to use it. Rationale: `DESIGN_DECISIONS.md` §1.
-2. **Caglioti parameter randomization.** Sample U, V, W from physically realistic instrument-to-instrument ranges spanning sharp synchrotron sources to broadened lab diffractometers.
-3. **Matched d-range simulation.** Choose the d-window first (default 0.7 Å to 8 Å); for each sampled wavelength, compute the corresponding 2θ range and simulate over exactly that range. Guarantees all training patterns cover the same log-d window after binning.
+1. **Intensities** — DW envelope, LP, preferred orientation on `|F|²`; add impurity/spurious peaks.
+2. **2θ assembly** — `d→2θ(λ)` + global zero-shift; per-peak TCH-PV (Caglioti FWHM) ⊗ axial-divergence ⊗ slit → full 2θ pattern.
+3. **2θ instrument effects** — add residual background (or physical-bg-then-arPLS), then **Poisson counting noise** (on total counts).
+4. **Convert to log-d** — single resample (Jacobian-corrected).
+5. **Normalize** — max, or `√` (variance-stabilizes the Poisson noise).
+6. **log-d relative** — add Gaussian noise `σrel`; edge crop/pad → final rescale.
 
-**Additional augmentations:**
-
-4. **Zero shift.** In 2θ: `δ(2θ) ~ U(-0.02°, 0.02°)`. Mapped to the equivalent perturbation in log-d.
-5. **Position noise.** Per-peak white noise on positions (scaled appropriately by domain).
-6. **Peak cropping / padding.** Randomly crop tails of the pattern (low / high end of the active range).
-7. **Counting (Poisson) noise.** Photon counting makes XRD intensities Poisson-distributed (variance = mean), so noise scales as `√I` — concentrated on/near peaks, weak in valleys. Adopt the AlphaDiffract (Argonne, arXiv:2603.23367) normalization-invariant form:
-   `I_pois = max(I)/λmax · Poisson( λmax · I/max(I) )`, with `λmax ~ U(1, 100)`.
-   `λmax` is the effective peak-count / inverse-relative-background level: small `λmax` → few counts → sharp `√`-scaled spikes that can be **mistaken for peaks**; large `λmax` → clean. Applied **before the first normalization** (it is a count-domain effect). This replaces the old purely-multiplicative intensity noise as the primary noise term.
-8. **Relative Gaussian noise.** After the first normalization, add `N(0, σrel)` with `σrel ~ U(1e-3, 1e-1)` — baseline/readout noise defined relative to the normalized pattern (AlphaDiffract's second term). A small multiplicative `I·(1+ε)` jitter may accompany it.
-9. **Impurity peaks.** Insert 0–N random peaks (random position, random small intensity). Discrete in count by design (§5 principle; amplitude-slot relaxation available).
-10. **Residual background.** We train/align in the **background-subtracted** domain (`DATA_ROADMAP.md` §2), so a full physical background is the wrong model — model the *residual after subtraction* instead. Default: a low-order, low-amplitude smooth baseline (Chebyshev/spline) that may go slightly **negative** (bgsub over-subtracts). Optional `PRODUCTION` mode: add a physical background then subtract it with the **same `crystalai_data.xrddata.background.auto_background()` (arPLS) operator** used on the experimental store, so the residual distribution (and its interaction with the counting noise floor) matches real processing. See §5-ordering and `DESIGN_DECISIONS.md` §4a.
-11. **Mild profile asymmetry randomization.** Small randomization of Finger-Cox-Jephcoat asymmetry. Not aggressive — with wavelength as input, the model can learn the correct asymmetry-wavelength relationship.
-12. **Edge cropping / padding.** Trim or extend the range. The **hard** crop for masked-window training (`METHODS_ROADMAP.md`) is deliberately discrete.
-
-**Explicitly dropped:** intensity envelope perturbation (originally proposed as a defense against envelope shortcuts; counterproductive once wavelength is an explicit input — destroys real intensity information the generator needs).
-
-### Augmentation order and the first normalization
-
-The governing rule follows from the physics: **count/absolute-scale effects go before the first normalization; relative/position effects go after.** Counting noise has variance = mean *in counts*, so it must see true intensities; Gaussian/relative noise is defined against the normalized pattern. The canonical sequence:
-
-1. **Peak-list domain** — DW envelope, LP, preferred orientation, peak-position jitter, peak drop, impurity peaks.
-2. **Profile** — Caglioti FWHM → convolution → clean profile.
-3. **Pre-normalization (count/physical domain)** — residual background (or physical-background-then-arPLS in `PRODUCTION`), then **Poisson counting noise** (#7).
-4. **First normalization** — max, or `√` (variance-stabilizes the Poisson noise added in step 3).
-5. **Post-normalization (relative domain)** — **relative Gaussian noise** (#8), zero-shift, soft-crop/hard-crop, small relative intensity jitter → final rescale.
-
-This matches AlphaDiffract's Poisson → normalize → Gaussian ordering and keeps the two noise terms on the correct sides of the normalization. The noise level (`λmax`, `σrel`) sampled here is emitted as conditioning metadata (Phase 5.2), so the model is told the noise floor it is looking at (`DESIGN_DECISIONS.md` §4a).
+Steps 1–4 are the 2θ-build→log-d flow; steps 3–6 match AlphaDiffract's background/Poisson → normalize → Gaussian. The global zero-shift (step 2) is applied in 2θ before the resample, so in log-d it becomes an angle-dependent distortion, not a rigid translation.
 
 ---
 
-## 6. Peak-position augmentations (importance-aware)
+## 6. Peak-list augmentation: model the human-picked list
 
-Peak-position augmentations respect the physical role of each peak in lattice and SG determination. See `DESIGN_DECISIONS.md` §7 for the full reasoning chain.
+The peak-list channel's inference input is a **manually picked** list, so its augmentations model *how a human produces it* — not arbitrary corruption. (The full-profile channel is the raw measurement and keeps exact, complete positions — §5; only the peak-list view gets the human-error model here.) Rationale and the reconciliation with the lattice/SG physics: `DESIGN_DECISIONS.md` §7.
 
-**Rules:**
+1. **Position error (selection jitter + off-center bias).** A human clicks a point that is slightly off the true profile centroid — sometimes on the profile shoulder rather than the maximum. Model as a small per-peak Gaussian jitter plus an optional small off-center bias, **sub-FWHM**, scaled in log-d. This is why the peak-list view is *not* fed idealized-clean positions: at inference it never is.
+2. **Selective low-d (high-2θ) dropping.** Humans pick the prominent low-2θ (high-d) peaks and skip much of the dense high-2θ (low-d) forest. So when a pattern is **peak-dense**, drop preferentially from the **low-d / high-2θ end**, keeping the high-d peaks. **Guarded by a manufactured-absence check**: never drop a reflection whose removal would fabricate a diagnostic systematic absence — i.e. drop only while the retained high-d peaks still determine the space group. (This implements "drop low-d peaks if the high-d peaks are enough to predict the SG.")
+3. **Spurious peaks.** Insert 0–3 additive impurity/contaminant peaks (random position, small intensity).
 
-1. **Position jitter is angle-aware.** Per-peak jitter scales with local peak FWHM in log-d (approximately uniform under W1), with a floor preventing collapse at low d.
-2. **Three-component drop model** (discrete Bernoulli per peak by design — §5 principle; a continuous per-peak attenuation `a_i∈[0,1]` is the aspirational differentiable relaxation, not the default):
-   - *Correlated-failure*: drop probability elevated for neighbours within a configurable log-d window when one peak is dropped.
-   - *High-information protection*: peaks above a 2θ threshold (default ~60° at Cu Kα equivalent) have drop probability multiplicatively capped (default 0.2×).
-   - *Baseline random*: small uniform component for true random misses (default 0.05).
-3. **Manufactured-absence guard (hard reject).** After every augmentation draw, check the resulting peak list against the source CIF's extinction conditions. If any reflection removed is one whose presence is *diagnostic* for the true space group (its observation rules out a higher-symmetry alternative), reject the draw and resample.
-4. **Spurious peaks unchanged from the original spec.** 0–3 random spurious peaks per pattern.
-
-**Hyperparameter defaults are starting points to be tuned.** See `DESIGN_DECISIONS.md` §7 for the table.
+**Tradeoff (a deliberate reversal of the earlier 'protect high-2θ' rule).** High-2θ/low-d peaks pin the lattice most tightly, so preferentially dropping them costs lattice precision in `z_lattice_peaks`. We accept it because it matches the *real* manual input; the profile view (complete, exact positions) carries the lattice-precision load in the VICReg-aligned pair, and the drop guard protects SG determination.
 
 ---
 
@@ -343,10 +290,10 @@ Before this package is considered ready for `CrystalAI-methods`:
 2. **Relative intensity agreement.** Pearson correlation > 0.95 between our integrated intensities and pymatgen's for standard references (LaB6, CeO₂, Si).
 3. **Disorder fidelity.** For disordered test CIFs, the full pipeline (serialize to SQLite, deserialize, run Bragg calculator) produces integrated intensities matching pymatgen's `XRDCalculator` to within 1% relative for all peaks above 1% intensity. Species occupancies and fractional coordinates round-trip at full numerical precision.
 4. **Domain round-trip fidelity.** Simulate in 2θ → convert to log-d → convert back to 2θ; integrated intensity per peak preserved within 2%. Peak positions preserved within 0.01° after round-trip.
-5. **Native log-d vs converted consistency.** Strategy B (native log-d) and Strategy A (simulate-in-2θ-then-convert) agree on peak positions within 0.001 Å and integrated intensities within 3% relative.
-6. **Experimental realism.** For at least 5 crystals where both a CIF and an experimental pattern are available in `crystalai-data`, the simulated pattern (with appropriate broadening / background settings) achieves Rwp < 15%.
+5. **Production resample fidelity + fast-preset error.** The production path (per-peak 2θ construction → log-d resample) preserves integrated intensity per peak within 2% and peak positions within 0.001 Å vs. the same profile evaluated on a dense 2θ grid. Separately, the optional fast native-log-d single-kernel preset is expected to *disagree* with production only in the asymmetric instrumental tails (axial divergence) — that gap is measured and documented as the preset's known approximation error, not required to be small.
+6. **Experimental realism (noise-aware).** For ≥ 5 crystals with both a CIF and an experimental pattern in `crystalai-data`, the forward-simulated pattern — compared to the **raw** counts in **2θ** with a jointly-fitted Chebyshev background + scale (`compare_structure_to_raw`) and effects refined — achieves **goodness-of-fit `GoF = Rwp / Rwp_noise_floor < 4`** (i.e. the profile fit is within ~4× the counting-noise floor). The **Rietveld-partition `R_Bragg`** is reported as a structural bug-detector (a value ≫ typical, or a gross outlier, flags a real `|F|²`/position error), **not** gated at a refinement-grade threshold: a *forward* simulator of a **fixed** ICSD structure floors at `R_Bragg ≈ 20–60%` because it does not refine atoms/thermals/occupancy or model full texture (single-axis March-Dollase only) or absorption — `R_Bragg ≤ 5%` is a post-*refinement* number, out of scope here. Raw Rwp and cosine are also reported. Rationale and the metric derivations (`Rwp = √(1−cos²_w)`, the log-d-vs-2θ background Jacobian pitfall, the noise floor) live in `DESIGN_DECISIONS.md` §10. Reproduce with `scripts/validate_criterion6.py`.
 7. **Augmentation coverage.** Augmented simulated patterns visually span the variability range of experimental patterns (qualitative, assessed via t-SNE of augmented sim vs experimental distributions in feature space).
-8. **Performance.** Batch simulation of 1000 CIFs under one condition completes in < 5 minutes on a single CPU core.
+8. **Performance.** Batch simulation of 1000 CIFs under one condition completes in < 1 minute on a single CPU core.
 9. **Precompute/on-the-fly split is lossless (§1 boundary).** A pattern built on-the-fly from the cached `{d, |F|²}` peak list matches a full from-scratch simulation (identical conditions, no cache) to within peak positions ≤ 0.001 Å (d) and integrated intensities ≤ 1% for all test CIFs.
 10. **DataLoader throughput.** From the precomputed `bragg_peaks` store, the live path (crop → DW → LP → Caglioti → convolve → augment) sustains the per-worker rate needed to feed 8 GPUs, with latency **flat across structure size** (no heavy-tail stalls) — the property the precompute exists to guarantee.
 
@@ -356,5 +303,5 @@ Before this package is considered ready for `CrystalAI-methods`:
 
 | Consumer | What it gets |
 |----------|--------------|
-| `CrystalAI-methods` | `Simulator` (CIF → `SimulatedPattern`), `ProfileAugmentor` (composable augmentation pipeline), `PeakAugmentor` (importance-aware peak-list augmentation), `Domain` enum, `SimulatedPattern` dataclass |
+| `CrystalAI-methods` | `Simulator` (CIF → `SimulatedPattern`), `ProfileAugmentor` (composable augmentation pipeline), `PeakAugmentor` (additive spurious-peak augmentation; positions never perturbed), `Domain` enum, `SimulatedPattern` dataclass |
 | Standalone usage | `scripts/simulate_batch.py`, `scripts/compare_with_experiment.py`, `app/dashboard.py` |

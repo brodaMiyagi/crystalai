@@ -82,8 +82,9 @@ def run(store: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    env = load_dotenv(repo_root() / ".env")
-    store_default = env.get("EXP_DATA_FOLDER", str(db.default_store()))
+    root = repo_root()
+    env = load_dotenv(root / ".env")
+    store_default = str(db.resolve_store(env, root))
 
     p = argparse.ArgumentParser(description="Wavelength audit over the experimental store")
     p.add_argument("--store", default=store_default, type=str)

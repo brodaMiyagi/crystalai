@@ -12,7 +12,9 @@ indexed/refined and cross-referenced to its ICSD entry. Layout under
     ``x, y_obs, weight, y_calc, y_bkg, Q``. ``y_obs`` is the raw profile and
     ``y_bkg`` a refined native background on the same 2θ grid, so both ``raw.xy``
     and a native ``bgsub.xy`` (``y_obs - y_bkg``, ``autobg=0``) come from one file.
-  * ``data_and_expo_runs/<ID>/`` — EXPO indexing tables + binaries; not ingested.
+  * ``data_and_expo_runs/<ID>/<ID>.pea`` — manually-picked peak list (d-spacings, Å) fed
+    to EXPO. Converted to a RRUFF-consistent ``peaks.xy`` (2θ, intensity sampled from the
+    bgsub profile and scaled to 100). Other EXPO tables/binaries there are not ingested.
 
 Labels are read, never re-derived: ``SG`` from the CSV integer, ``CS`` via
 ``sg_to_cs`` (verified against the CSV ``CS``), cell from the CSV. The **ICSD
@@ -36,6 +38,8 @@ from __future__ import annotations
 import argparse
 import sqlite3
 from pathlib import Path
+
+import numpy as np
 
 from ..crystals._ingest import load_dotenv, repo_root
 from ..crystals.symmetry import sg_to_cs
@@ -93,6 +97,57 @@ def _read_pattern(bg_csv: Path):
     if not x:
         raise ValueError("background csv has no rows")
     return x, y_obs, y_bkg
+
+
+def _read_pea(path: Path) -> list[float]:
+    """Read a EXPO ``.pea`` file: one manually-picked peak **d-spacing** (Å) per line."""
+    ds: list[float] = []
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            ds.append(float(s.split()[0]))
+        except ValueError:
+            continue
+    return ds
+
+
+def _peaks_to_two_theta(
+    d_spacings: list[float], wavelength: float,
+    x: list[float], y: list[float], window: float = 0.05,
+) -> tuple[list[float], list[float]]:
+    """Convert a d-spacing peak list to ``(2θ, intensity)`` consistent with RRUFF ``peaks.xy``.
+
+    Bragg: ``2θ = 2·asin(λ/2d)``. The ``.pea`` list carries no intensities (EXPO picks
+    positions only), so each peak's height is **sampled from the bgsub profile** — the
+    local max within ``±window`` degrees (robust to small grid/pick offsets) — then the
+    whole list is scaled to 100 like RRUFF. Peaks outside the measured range or with
+    ``λ/2d > 1`` (unphysical) are dropped.
+    """
+    xa, ya = np.asarray(x, float), np.asarray(y, float)
+    tts: list[float] = []
+    ints: list[float] = []
+    for d in d_spacings:
+        ratio = wavelength / (2.0 * d)
+        if not 0.0 < ratio <= 1.0:
+            continue
+        tt = float(2.0 * np.degrees(np.arcsin(ratio)))
+        if tt < xa[0] or tt > xa[-1]:
+            continue
+        sel = (xa >= tt - window) & (xa <= tt + window)
+        inten = float(ya[sel].max()) if sel.any() else float(np.interp(tt, xa, ya))
+        tts.append(tt)
+        ints.append(max(inten, 0.0))
+    if not tts:
+        return [], []
+    order = np.argsort(tts)
+    tt_s = np.asarray(tts)[order]
+    in_s = np.asarray(ints)[order]
+    peak = in_s.max()
+    if peak > 0:
+        in_s = in_s / peak * 100.0
+    return tt_s.tolist(), in_s.tolist()
 
 
 def convert(*, data_dir: Path, store: Path, crystals_db: Path) -> None:
@@ -165,6 +220,17 @@ def convert(*, data_dir: Path, store: Path, crystals_db: Path) -> None:
         bgsub = [o - b for o, b in zip(y_obs, y_bkg, strict=True)]
         db.write_xy(pdir / "bgsub.xy", x, bgsub, header=[*prov, "view=bgsub (native y_obs-y_bkg)"])
 
+        # Manually-picked peak list (EXPO .pea, d-spacings) -> peaks.xy in 2θ, RRUFF-style.
+        peaks_rel: str | None = None
+        pea_file = data_dir / "data_and_expo_runs" / rid / f"{rid}.pea"
+        if pea_file.is_file() and wavelength is not None:
+            tt_pk, i_pk = _peaks_to_two_theta(_read_pea(pea_file), wavelength, x, bgsub)
+            if tt_pk:
+                db.write_xy(pdir / "peaks.xy", tt_pk, i_pk,
+                            header=[*prov, "view=peaks (EXPO .pea d-list -> 2theta; "
+                                    "intensity sampled from bgsub, scaled to 100)"])
+                peaks_rel = f"patterns/lab/{source_id}/peaks.xy"
+
         csv_formula = rec["Structural Formula"]
         notes = f"icsd_collection_code={code}"
         if isinstance(csv_formula, str) and csv_formula.strip():
@@ -177,7 +243,7 @@ def convert(*, data_dir: Path, store: Path, crystals_db: Path) -> None:
                 raw_path=f"patterns/lab/{source_id}/raw.xy",
                 bgsub_path=f"patterns/lab/{source_id}/bgsub.xy",
                 autobg=0,  # native refined background (y_bkg), not auto-generated
-                peaks_path=None,
+                peaks_path=peaks_rel,
                 x_coord="two_theta",
                 wavelength_A=wavelength,
                 format="xy",
@@ -197,6 +263,7 @@ def convert(*, data_dir: Path, store: Path, crystals_db: Path) -> None:
     written = db.write_source_rows(store, "lab", rows)
     print(f"\n[lab] patterns written = {written} (of {len(df)} rows)")
     print(f"[lab] cif_id linked    = {sum(1 for r in rows if r.cif_id is not None)} (matched-sample)")
+    print(f"[lab] peak lists (.pea)= {sum(1 for r in rows if r.peaks_path is not None)} (2θ, from EXPO)")
     if sg_mismatch:
         print(f"[lab] NOTE: {sg_mismatch} rows had CSV SG != ICSD SG (kept CSV SG)")
     if rejects:
@@ -209,7 +276,7 @@ def main(argv: list[str] | None = None) -> None:
     root = repo_root()
     env = load_dotenv(root / ".env")
     data_default = env.get("RWTH-A_DATA_FOLDER")
-    store_default = env.get("EXP_DATA_FOLDER", str(db.default_store()))
+    store_default = str(db.resolve_store(env, root))
     crystals_default = env.get("CRYSTALS_DB", str(root / "crystalai-data" / "crystals.sqlite"))
 
     p = argparse.ArgumentParser(description="Ingest RWTH-A internal-lab patterns into the store")

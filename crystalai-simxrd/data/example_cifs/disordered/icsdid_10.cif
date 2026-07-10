@@ -1,0 +1,83 @@
+
+data_15-ICSD
+_database_code_ICSD 15
+_audit_creation_date 1980-01-01
+_audit_update_record 2009-08-01
+_chemical_name_common 'Manganese chromium iodide (0.67/0.33/2) - beta'
+_chemical_formula_structural '(Mn0.6666 Cr0.3333) I2'
+_chemical_formula_sum 'Cr0.3333 I2 Mn0.6666'
+_chemical_name_structure_type CuCl2
+_exptl_crystal_density_diffrn 5.06
+_citation_title 'Manganese(II) chrome(II) diiodure: phase beta des (Mn, Cr) I2'
+loop_
+_citation_id
+_citation_journal_full
+_citation_year
+_citation_journal_volume
+_citation_page_first
+_citation_page_last
+_citation_journal_id_ASTM
+primary
+
+;
+Acta Crystallographica, Section B: Structural Crystallography and Crystal
+Chemistry
+; 1976 32 311 312 ACBCAR
+loop_
+_citation_author_citation_id
+_citation_author_name
+primary 'Guen, L.'
+primary 'Nguyen, H.D.'
+_cell_length_a 7.441(2)
+_cell_length_b 7.448(2)
+_cell_length_c 3.978(2)
+_cell_angle_alpha 90.
+_cell_angle_beta 90.
+_cell_angle_gamma 113.66(2)
+_cell_volume 201.93
+_cell_formula_units_Z 2
+_space_group_name_H-M_alt 'B 1 1 2/m'
+_space_group_IT_number 12
+loop_
+_space_group_symop_id
+_space_group_symop_operation_xyz
+1 '-x, -y, z'
+2 '-x, -y, -z'
+3 'x, y, -z'
+4 'x, y, z'
+5 '-x+1/2, -y, z+1/2'
+6 '-x+1/2, -y, -z+1/2'
+7 'x+1/2, y, -z+1/2'
+8 'x+1/2, y, z+1/2'
+loop_
+_atom_type_symbol
+_atom_type_oxidation_number
+I1- -1
+Mn2+ 2
+Cr2+ 2
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_symmetry_multiplicity
+_atom_site_Wyckoff_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_B_iso_or_equiv
+_atom_site_occupancy
+I1 I1- 4 i 0.7374(4) 0.2417(5) 0 . 1.
+Mn1 Mn2+ 2 a 0 0 0 . 0.6666
+Cr1 Cr2+ 2 a 0 0 0 . 0.3333
+loop_
+_atom_site_aniso_label
+_atom_site_aniso_type_symbol
+_atom_site_aniso_beta_11
+_atom_site_aniso_beta_22
+_atom_site_aniso_beta_33
+_atom_site_aniso_beta_12
+_atom_site_aniso_beta_13
+_atom_site_aniso_beta_23
+I1 I1- 0.0083 0.0069 0.0023 0.0014 0 0
+Mn1 Mn2+ 0.01 0.0012 0.026 0.002 0 0
+Cr1 Cr2+ 0.1 0.0012 0.026 0.002 0 0
+#End of TTdata_15-ICSD
