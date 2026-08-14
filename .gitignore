@@ -10,5 +10,6 @@ __pycache__/
 *.safetensors
 wandb/
 temp/
+crystalai-simxrd/data/practicum_26*
 .env
 .claude

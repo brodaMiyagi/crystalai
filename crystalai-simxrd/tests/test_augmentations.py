@@ -26,7 +26,7 @@ def test_profile_augmentor_valid_and_conditioned(quartz):
         ap = aug(quartz, np.random.default_rng(i))
         assert len(ap.x_axis) == cfg.n_log_d_bins
         assert np.isfinite(ap.intensity).all()
-        assert ap.intensity.max() <= 1.0 + 5 * 0.1        # max-normalized (+ Gaussian tail)
+        assert np.isclose(ap.intensity.max(), 1.0)        # final log-d normalize forces max=1
         lam, sig = ap.noise_floor
         assert cfg.wavelength[0] <= ap.wavelength <= cfg.wavelength[1]
         assert cfg.lambda_max[0] <= lam <= cfg.lambda_max[1]
@@ -40,6 +40,29 @@ def test_profile_augmentor_is_stochastic(quartz):
     b = aug(quartz, np.random.default_rng(2))
     assert not np.allclose(a.intensity, b.intensity)      # different draws differ
     assert a.noise_floor != b.noise_floor
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_profile_augmentor_reproducible_with_same_rng_state(quartz):
+    """The whole draw — sampled params *and* simulate()'s internal noise (background,
+    Poisson, the single Gaussian-noise mechanism) — must be reproducible from the
+    augmentor's own `rng`, not just the sampled parameter values."""
+    aug = ProfileAugmentor()
+    a = aug(quartz, np.random.default_rng(0))
+    b = aug(quartz, np.random.default_rng(0))
+    assert np.allclose(a.intensity, b.intensity)
+    assert a.noise_floor == b.noise_floor
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_profile_augmentor_gaussian_noise_is_the_single_2theta_mechanism(quartz):
+    """sample_effects() must route σrel into EffectConfig.gaussian_noise_std (mean=0) —
+    there is no separate log-d-native Gaussian noise path (SIMXRD_ROADMAP §5a)."""
+    aug = ProfileAugmentor()
+    eff, _inst, _wl = aug.sample_effects(np.random.default_rng(0))
+    assert eff.gaussian_noise_mean == 0.0
+    assert aug.config.sigma_rel[0] <= eff.gaussian_noise_std <= aug.config.sigma_rel[1]
+    assert eff.rng_seed is not None
 
 
 @pytest.mark.filterwarnings("ignore")

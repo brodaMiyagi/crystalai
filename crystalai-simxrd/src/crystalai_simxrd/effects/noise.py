@@ -1,9 +1,11 @@
-"""Counting (Poisson) and baseline (Gaussian) noise (AlphaDiffract, arXiv:2603.23367).
+"""Counting (Poisson) and full-profile (Gaussian) noise (AlphaDiffract, arXiv:2603.23367).
 
-`(λmax, σrel)` are the noise-floor conditioning pair (DESIGN_DECISIONS §4a). Poisson
-is a **count-domain** effect (variance = mean) applied in 2θ on the total counts
-(profile + background), *before* the first normalization; relative Gaussian is applied
-in log-d *after* normalization. See SIMXRD_ROADMAP §5.
+`(λmax, σrel)` are the noise-floor conditioning pair (DESIGN_DECISIONS §4a). Both are
+**2θ-domain** effects applied inside `simulate()`, before the single conversion to the
+output domain (SIMXRD_ROADMAP §5, §5a) — there is no log-d-native noise anywhere on
+this path. Poisson is count-domain (variance = mean) on the total 2θ counts (profile +
+background); the Gaussian noise here (`relative_gaussian`) normalizes to [0,1], adds
+`N(mean, std)`, and re-normalizes, all in 2θ.
 """
 
 from __future__ import annotations
@@ -31,11 +33,21 @@ def poisson_counting(
 
 
 def relative_gaussian(
-    pattern_normalized: NDArray, sigma_rel: float, rng: np.random.Generator | None = None
+    pattern_normalized: NDArray, sigma_rel: float, rng: np.random.Generator | None = None,
+    mean: float = 0.0,
 ) -> NDArray:
-    """Add ``N(0, σrel)`` to an already-normalized pattern (baseline/readout noise)."""
-    if sigma_rel <= 0:
+    """Add ``N(mean, σrel)`` to an already-normalized pattern (baseline/readout noise).
+
+    The single Gaussian-noise mechanism on the simulation path (SIMXRD_ROADMAP.md §5a),
+    called from inside ``simulate()`` on the 2θ pattern, before any domain conversion —
+    never natively in log-d. ``ProfileAugmentor`` uses ``mean=0`` (the σrel
+    training-noise-floor conditioning case, DESIGN_DECISIONS.md §4a); a direct
+    ``EffectConfig.gaussian_noise_mean/_std`` caller (e.g. the dashboard) can set
+    either to a nonzero value.
+    """
+    sigma_rel = max(float(sigma_rel), 0.0)
+    if sigma_rel <= 0 and mean == 0.0:
         return np.asarray(pattern_normalized, dtype=np.float64)
     rng = rng or np.random.default_rng()
     p = np.asarray(pattern_normalized, dtype=np.float64)
-    return p + rng.normal(0.0, sigma_rel, size=p.shape)
+    return p + rng.normal(mean, sigma_rel, size=p.shape)

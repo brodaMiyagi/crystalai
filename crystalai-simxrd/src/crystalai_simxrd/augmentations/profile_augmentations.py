@@ -1,10 +1,15 @@
 """On-the-fly profile augmentation (SIMXRD_ROADMAP §5).
 
 Augmentation here means: **sample** the simulation parameters from config-bounded
-ranges (`θ ~ U[lo, hi]`), simulate the pattern over the matched d-window, then apply
-counting noise (in 2θ, inside the simulator), normalize, and add relative Gaussian
-noise (in log-d). The `(λmax, σrel)` noise floor is emitted as conditioning
-(DESIGN_DECISIONS §4a). Physics is regenerated each call — nothing is pre-computed.
+ranges (`θ ~ U[lo, hi]`), then call `simulate()` over the matched d-window. All
+noise — Poisson counting noise *and* the full-profile Gaussian noise — is applied
+inside `simulate()`, in 2θ, before the single conversion to log-d (SIMXRD_ROADMAP
+§5a: there is exactly one Gaussian-noise mechanism, and it is 2θ-native like every
+other physical effect). What follows the conversion here is only the final log-d
+normalization. The `(λmax, σrel)` noise floor is still emitted as conditioning
+(DESIGN_DECISIONS §4a) — `σrel` now names the std fed to
+`EffectConfig.gaussian_noise_std` rather than a separate log-d-native effect.
+Physics is regenerated each call — nothing is pre-computed.
 
 NumPy throughout; the torch-`nn.Module` wrapper is the Phase-5.2 public-API concern.
 """
@@ -19,7 +24,6 @@ from pymatgen.core import Structure
 
 from ..core.bragg import BraggPeaks
 from ..core.domain import Domain, d_to_two_theta
-from ..effects.noise import relative_gaussian
 from ..profiles.caglioti import InstrumentParameters
 from ..simulation.simulator import EffectConfig, simulate
 from ..utils.normalization import normalize
@@ -47,7 +51,7 @@ class AugmentConfig:
     background_choices: tuple = ("residual", None)
     background_rel_amplitude: tuple[float, float] = (0.0, 0.05)
     lambda_max: tuple[float, float] = (1.0, 100.0)         # log-uniform (AlphaDiffract)
-    sigma_rel: tuple[float, float] = (1e-3, 1e-1)          # log-uniform
+    sigma_rel: tuple[float, float] = (1e-3, 1e-1)          # log-uniform; -> gaussian_noise_std (2θ, §5a)
     normalization: str = "max"
     d_window: tuple[float, float] = (0.7, 18.0)
     n_log_d_bins: int = 12000
@@ -101,6 +105,11 @@ class ProfileAugmentor:
             background=c.background_choices[rng.integers(len(c.background_choices))],
             background_rel_amplitude=_u(rng, c.background_rel_amplitude),
             poisson_lambda_max=_logu(rng, c.lambda_max),
+            gaussian_noise_mean=0.0,
+            gaussian_noise_std=_logu(rng, c.sigma_rel),
+            # ties simulate()'s internal noise draws (background/Poisson/Gaussian) to this
+            # augmentor's own rng, so a seeded `rng` reproduces the whole draw end-to-end.
+            rng_seed=int(rng.integers(0, 2**31 - 1)),
         )
         return eff, inst, wl
 
@@ -111,16 +120,17 @@ class ProfileAugmentor:
         c = self.config
         eff, inst, wl = self.sample_effects(rng)
         lambda_max = eff.poisson_lambda_max
-        sigma_rel = _logu(rng, c.sigma_rel)
+        sigma_rel = eff.gaussian_noise_std
 
         sim = simulate(
             source, wl, domain=Domain.LOG_D, instrument=inst, effects=eff,
             two_theta_range=self._matched_two_theta_range(wl),
             d_window=c.d_window, n_log_d_bins=c.n_log_d_bins,
         )
-        # Poisson already applied (2θ, in simulator) → normalize → relative Gaussian (log-d).
+        # Poisson counting noise and the full-profile Gaussian noise are both already
+        # applied inside simulate() (2θ, before the log-d conversion — SIMXRD_ROADMAP
+        # §5a); this final normalize is the only step left in log-d.
         intensity = normalize(sim.intensity, c.normalization)
-        intensity = relative_gaussian(intensity, sigma_rel, rng)
 
         return AugmentedPattern(
             x_axis=sim.x_axis, intensity=intensity, wavelength=wl,

@@ -14,6 +14,8 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "wandb",
+    "safetensors",
+    "huggingface_hub",
     "crystalai-data",
     "crystalai-simxrd",
 ]
@@ -24,3 +26,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/crystalai_methods"]
+
+[tool.ruff]
+# Vendored third-party model code (OpenAlphaDiffract) is kept verbatim.
+extend-exclude = ["src/crystalai_methods/baselines/alphadiffract/vendor"]

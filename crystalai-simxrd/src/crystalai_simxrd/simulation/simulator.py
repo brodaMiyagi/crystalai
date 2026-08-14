@@ -4,8 +4,14 @@ Phase 1: Bragg peaks → 2θ assembly (TCH-PV, Caglioti, LP) → single log-d co
 Phase 2: optional physical effects via `EffectConfig`, applied in the SIMXRD_ROADMAP
 §5 order — Debye-Waller + preferred orientation on the integrated intensities;
 size/strain broadening on the widths; zero-shift on the centres; axial-divergence and
-slit on the assembled 2θ pattern; residual background in 2θ — all **before** the single
-conversion to log-d. Noise/augmentation is Phase 3.
+slit on the assembled 2θ pattern; residual background in 2θ; Poisson counting noise
+(2θ, on total counts) then full-profile Gaussian noise (2θ, on the max-normalized
+pattern — SIMXRD_ROADMAP §5a) — all **before** the single conversion to the output
+domain, so d/log-d outputs inherit noise added in 2θ rather than adding it natively
+post-conversion. Training-time augmentation (`ProfileAugmentor`, Phase 3) samples these
+same `EffectConfig` fields — including `gaussian_noise_std` for the σrel noise-floor
+conditioning pair — and simulates through this same 2θ-first path; it adds nothing
+noise-related natively in log-d.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from ..core.domain import Domain
 from ..effects.axial_divergence import apply_axial_divergence
 from ..effects.background import physical_background, sample_residual_background
 from ..effects.broadening import size_strain_fwhm
-from ..effects.noise import poisson_counting
+from ..effects.noise import poisson_counting, relative_gaussian
 from ..effects.preferred_orientation import preferred_orientation_correction
 from ..effects.slit import apply_slit
 from ..effects.thermal import debye_waller_envelope
@@ -29,6 +35,7 @@ from ..effects.zero_shift import apply_zero_shift
 from ..profiles.caglioti import SIMXRD_DEFAULT, InstrumentParameters, instrument_fwhm
 from ..profiles.convolver import convolve_two_theta, resample_two_theta_to_log_d
 from ..utils.binning import make_log_d_grid, make_two_theta_grid
+from ..utils.normalization import normalize
 
 
 @dataclass(slots=True)
@@ -49,6 +56,8 @@ class EffectConfig:
     background: str | None = None                      # None | 'residual' | 'physical'
     background_rel_amplitude: float = 0.03
     poisson_lambda_max: float | None = None            # counting noise (2θ); None = off
+    gaussian_noise_mean: float = 0.0                    # full-profile noise (2θ, [0,1]); §5a
+    gaussian_noise_std: float = 0.0                     # 0 = off
     rng_seed: int | None = None
 
 
@@ -134,6 +143,18 @@ def simulate(
     # counting (Poisson) noise: count-domain, on total 2θ counts, before conversion
     if cfg.poisson_lambda_max is not None:
         pattern_tt = poisson_counting(pattern_tt, cfg.poisson_lambda_max, rng)
+
+    # full-profile Gaussian noise: imitates the ripple left behind by *manual*
+    # background subtraction at inference (SIMXRD_ROADMAP §5a). Max-normalize to
+    # [0, 1], add N(mean, std), then re-max-normalize to [0, 1] — always in 2θ, even
+    # for d/log-d output, so the single conversion below resamples an already-noisy
+    # 2θ pattern rather than adding noise natively post-conversion.
+    if cfg.gaussian_noise_std > 0 or cfg.gaussian_noise_mean != 0.0:
+        pattern_tt = normalize(pattern_tt, method="max")
+        pattern_tt = relative_gaussian(
+            pattern_tt, cfg.gaussian_noise_std, rng, mean=cfg.gaussian_noise_mean
+        )
+        pattern_tt = normalize(pattern_tt, method="max")
 
     # --- single conversion to the output domain ---
     if domain == Domain.TWO_THETA:

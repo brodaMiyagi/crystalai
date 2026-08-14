@@ -82,3 +82,32 @@ def test_full_effects_log_d_is_finite(ceo2):
         background="residual", rng_seed=1))
     assert len(p.x_axis) == 12000
     assert np.isfinite(p.intensity).all()
+
+
+def test_full_profile_gaussian_noise_off_is_identity(ceo2):
+    base = _tt(ceo2, EffectConfig(rng_seed=0))
+    off = _tt(ceo2, EffectConfig(gaussian_noise_mean=0.0, gaussian_noise_std=0.0, rng_seed=0))
+    assert np.allclose(base.intensity, off.intensity)
+
+
+def test_full_profile_gaussian_noise_bounded_and_negative_in_two_theta(ceo2):
+    noisy = _tt(ceo2, EffectConfig(gaussian_noise_mean=0.0, gaussian_noise_std=0.01, rng_seed=0))
+    assert np.isclose(noisy.intensity.max(), 1.0)
+    assert noisy.intensity.min() < 0.0          # ripples dip slightly negative, like residual bg
+
+
+def test_full_profile_gaussian_noise_reproducible_with_seed(ceo2):
+    a = _tt(ceo2, EffectConfig(gaussian_noise_mean=0.01, gaussian_noise_std=0.02, rng_seed=7))
+    b = _tt(ceo2, EffectConfig(gaussian_noise_mean=0.01, gaussian_noise_std=0.02, rng_seed=7))
+    assert np.allclose(a.intensity, b.intensity)
+
+
+def test_full_profile_gaussian_noise_applied_in_two_theta_before_log_d_convert(ceo2):
+    """The noise must be added to the 2θ-domain pattern before the single conversion
+    to log-d — not natively in log-d — so the log-d output isn't re-bounded to [0,1]
+    by the (non-normalizing) Jacobian resample (SIMXRD_ROADMAP §5a)."""
+    p = simulate(ceo2, WL, domain=Domain.LOG_D,
+                effects=EffectConfig(gaussian_noise_mean=0.0, gaussian_noise_std=0.01, rng_seed=0))
+    assert len(p.x_axis) == 12000
+    assert np.isfinite(p.intensity).all()
+    assert p.intensity.max() > 1.0 + 1e-6      # Jacobian-resampled, not re-clamped to [0,1]

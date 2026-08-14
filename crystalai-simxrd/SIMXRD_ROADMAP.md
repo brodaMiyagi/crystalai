@@ -248,7 +248,7 @@ Composable, domain-aware transforms applied on-the-fly (never pre-computed into 
 | Global zero-shift | δ(2θ) | U(−δ₀, δ₀) | whole-pattern offset (sample-displacement); *not* per-peak (§6) |
 | **Stochastic / additive** ||||
 | Poisson noise | λmax | U[1, 100] | counting noise, in 2θ; formula in `DESIGN_DECISIONS.md` §4a; primary noise |
-| Gaussian noise | σrel | U[1e-3, 1e-1] | relative, in log-d after normalization |
+| Gaussian noise | σrel (`gaussian_noise_std`; mean=0 here) | U[1e-3, 1e-1] | full-profile, **in 2θ** before the log-d conversion — normalize→add `N(0,σrel)`→re-normalize; §5a |
 | Residual background | amplitude | small, may go negative | bgsub-domain residual; optional arPLS-emulation (`PRODUCTION`) reuses `crystalai_data`'s operator |
 | Impurity/spurious peaks | count | 0–N | additive; never touches/removes a true peak |
 | Edge crop / pad | edge | — | hard crop for masked-window training (methods) |
@@ -257,16 +257,27 @@ Composable, domain-aware transforms applied on-the-fly (never pre-computed into 
 
 ### Order (single 2θ → log-d conversion)
 
-**All CW-instrument physics is applied in 2θ; convert to log-d once; normalization and relative noise follow in log-d** (`DESIGN_DECISIONS.md` §1a). Count-domain effects precede normalization; relative effects follow it.
+**All CW-instrument physics *and* all noise is applied in 2θ; convert to log-d once; only normalization follows in log-d** (`DESIGN_DECISIONS.md` §1a). There is exactly one Gaussian-noise mechanism (§5a) — no separate log-d-native variant.
 
 1. **Intensities** — DW envelope, LP, preferred orientation on `|F|²`; add impurity/spurious peaks.
 2. **2θ assembly** — `d→2θ(λ)` + global zero-shift; per-peak TCH-PV (Caglioti FWHM) ⊗ axial-divergence ⊗ slit → full 2θ pattern.
-3. **2θ instrument effects** — add residual background (or physical-bg-then-arPLS), then **Poisson counting noise** (on total counts).
+3. **2θ instrument effects** — add residual background (or physical-bg-then-arPLS), then **Poisson counting noise** (on total counts), then **full-profile Gaussian noise** (normalize → add `N(mean,σrel)` → re-normalize, all in 2θ; §5a).
 4. **Convert to log-d** — single resample (Jacobian-corrected).
-5. **Normalize** — max, or `√` (variance-stabilizes the Poisson noise).
-6. **log-d relative** — add Gaussian noise `σrel`; edge crop/pad → final rescale.
+5. **Normalize** — max, or `√` (variance-stabilizes the Poisson noise); edge crop/pad → final rescale.
 
-Steps 1–4 are the 2θ-build→log-d flow; steps 3–6 match AlphaDiffract's background/Poisson → normalize → Gaussian. The global zero-shift (step 2) is applied in 2θ before the resample, so in log-d it becomes an angle-dependent distortion, not a rigid translation.
+Steps 1–4 are the 2θ-build→log-d flow; step 3 matches AlphaDiffract's background → Poisson → Gaussian, just kept entirely in 2θ rather than splitting the Gaussian term into log-d. The global zero-shift (step 2) is applied in 2θ before the resample, so in log-d it becomes an angle-dependent distortion, not a rigid translation.
+
+### 5a. Full-profile Gaussian noise mechanism
+
+`EffectConfig.gaussian_noise_mean` / `gaussian_noise_std` is `simulate()`'s Gaussian-noise effect (Phase 2 — used by the dashboard's Single Pattern tab, any direct `EffectConfig` caller, *and* `ProfileAugmentor`'s training pipeline, which samples `gaussian_noise_std` from `AugmentConfig.sigma_rel` with `mean=0` and emits it as the `σrel` half of the `(λmax, σrel)` conditioning pair, `DESIGN_DECISIONS.md` §4a). There is only this one mechanism — no separate log-d-native Gaussian noise exists anywhere in the simulation path. Its purpose: let a caller preview (or train against) what a *manually background-subtracted* pattern looks like — after an analyst subtracts background there is a low-amplitude ripple left behind (noise, not Bragg peaks), and the pattern is then renormalized to [0, 1] before further use.
+
+**Mechanism**, applied to the assembled 2θ pattern (`pattern_tt`) immediately after Poisson counting noise, regardless of the requested output domain:
+
+1. Max-normalize `pattern_tt` to [0, 1] (`utils/normalization.normalize(..., method="max")`).
+2. Add `N(mean, std)` (`effects/noise.relative_gaussian`).
+3. Max-normalize again to [0, 1].
+
+**Always in 2θ, even for d/log-d output.** This mirrors how every other 2θ-native effect (background, Poisson) is applied before the single domain conversion (§1a): for `domain=LOG_D`, the *already noisy, already renormalized* 2θ pattern is what gets Jacobian-resampled to log-d — the noise is never added natively in log-d. Because the log-d resample is intensity-conserving (not renormalizing), the returned log-d pattern is **not** itself re-bounded to [0, 1] after conversion — same as every other effect on this path (`simulate()` never globally normalizes its output; that stays a caller concern, e.g. `ProfileAugmentor`'s final `normalize()` call or the dashboard's plot normalization). Only the 2θ-domain output is directly [0, 1]-bounded by construction.
 
 ---
 
