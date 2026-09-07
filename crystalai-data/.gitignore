@@ -7,3 +7,6 @@ exp_data/
 __pycache__/
 *.pyc
 .venv/
+
+# Notebook-derived caches (regenerated from exp_data/)
+notebooks/nb_cache/
